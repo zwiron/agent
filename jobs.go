@@ -89,7 +89,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	progressWg.Add(1)
 	go func() {
 		defer progressWg.Done()
-		a.reportJobProgress(progressCtx, jobID, store)
+		a.reportJobProgress(progressCtx, jobID, store, workers)
 	}()
 
 	// Run the engine.
@@ -156,7 +156,7 @@ func (a *Agent) handleCancelJob(ctx context.Context, cmd *agentv1.CancelJob) {
 }
 
 // reportJobProgress periodically reads checkpoint state and sends progress.
-func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store) {
+func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store, workerCount int) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -165,24 +165,25 @@ func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store check
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.sendProgressSnapshot(jobID, store)
+			a.sendProgressSnapshot(jobID, store, workerCount)
 		}
 	}
 }
 
-func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store) {
+func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, workerCount int) {
 	jobs, err := store.ListJobs(context.Background())
 	if err != nil {
 		return
 	}
 
-	var totalRows, rowsCompleted int64
+	var rowsCompleted int64
 	var tasksTotal, tasksCompleted, tasksRunning, tasksPending, tasksFailed int
 	var rowsPerSec float64
+	var jobIDLocal string
 
 	for _, j := range jobs {
-		totalRows += j.TotalRows
 		rowsCompleted += j.TotalRows
+		jobIDLocal = j.ID
 
 		p, err := store.JobProgress(context.Background(), j.ID)
 		if err != nil {
@@ -202,11 +203,31 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store) {
 		pct = float64(tasksCompleted) / float64(tasksTotal) * 100
 	}
 
+	// Collect per-worker snapshots.
+	var workerStatuses []*agentv1.WorkerStatus
+	if jobIDLocal != "" {
+		snapshots, err := store.WorkerSnapshots(context.Background(), jobIDLocal, workerCount)
+		if err == nil {
+			for _, ws := range snapshots {
+				workerStatuses = append(workerStatuses, &agentv1.WorkerStatus{
+					WorkerId:  ws.WorkerID,
+					Status:    ws.Status,
+					TaskId:    ws.TaskID,
+					TableName: ws.TableName,
+					RangeStr:  ws.RangeStr,
+					RowsDone:  ws.RowsDone,
+					TasksDone: ws.TasksDone,
+					TotalRows: ws.TotalRows,
+				})
+			}
+		}
+	}
+
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_JobProgress{
 			JobProgress: &agentv1.JobProgress{
 				JobId:          jobID,
-				TotalRows:      totalRows,
+				TotalRows:      rowsCompleted,
 				RowsCompleted:  rowsCompleted,
 				RowsPerSec:     rowsPerSec,
 				Pct:            pct,
@@ -216,6 +237,7 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store) {
 				TasksPending:   int32(tasksPending),
 				TasksFailed:    int32(tasksFailed),
 				Timestamp:      timestamppb.Now(),
+				Workers:        workerStatuses,
 			},
 		},
 	})
