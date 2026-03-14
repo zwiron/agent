@@ -81,6 +81,8 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		Tables:       cmd.GetTables(),
 		Workers:      workers,
 		MaxRetries:   maxRetries,
+		SyncMode:     cmd.GetSyncMode(),
+		DestSyncMode: cmd.GetDestSyncMode(),
 	}
 
 	// Start progress reporter in background.
@@ -177,38 +179,75 @@ func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store check
 }
 
 func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, workerCount int) {
-	// Get progress for the specific job, not all checkpoint jobs.
-	p, err := store.JobProgress(context.Background(), jobID)
-	if err != nil {
+	// The engine creates one checkpoint job per table with its own ID,
+	// not the Atlas job ID. Aggregate across all checkpoint jobs.
+	cpJobs, err := store.ListJobs(context.Background())
+	if err != nil || len(cpJobs) == 0 {
 		return
 	}
 
-	// Get row count from the job record.
-	var rowsCompleted int64
-	if j, err := store.GetJob(context.Background(), jobID); err == nil {
-		rowsCompleted = j.TotalRows
+	var totalRows, rowsCompleted int64
+	var totalTasks, completedTasks, runningTasks, pendingTasks, failedTasks int64
+	var rowsPerSec float64
+	var allWorkerStatuses []*agentv1.WorkerStatus
+
+	for _, cpJob := range cpJobs {
+		p, err := store.JobProgress(context.Background(), cpJob.ID)
+		if err != nil {
+			continue
+		}
+		totalTasks += p.Total
+		completedTasks += p.Completed
+		runningTasks += p.Running
+		pendingTasks += p.Pending
+		failedTasks += p.Failed
+		totalRows += cpJob.TotalRows
+		rowsCompleted += cpJob.TotalRows
+		rowsPerSec += p.RowsPerSec
+
+		snapshots, err := store.WorkerSnapshots(context.Background(), cpJob.ID, workerCount)
+		if err == nil {
+			for _, ws := range snapshots {
+				allWorkerStatuses = append(allWorkerStatuses, &agentv1.WorkerStatus{
+					WorkerId:  ws.WorkerID,
+					Status:    ws.Status,
+					TaskId:    ws.TaskID,
+					TableName: ws.TableName,
+					RangeStr:  ws.RangeStr,
+					RowsDone:  ws.RowsDone,
+					TasksDone: ws.TasksDone,
+					TotalRows: ws.TotalRows,
+				})
+			}
+		}
 	}
 
 	pct := float64(0)
-	if p.Total > 0 {
-		pct = float64(p.Completed) / float64(p.Total) * 100
+	if totalTasks > 0 {
+		pct = float64(completedTasks) / float64(totalTasks) * 100
 	}
 
-	// Collect per-worker snapshots.
-	var workerStatuses []*agentv1.WorkerStatus
-	snapshots, err := store.WorkerSnapshots(context.Background(), jobID, workerCount)
-	if err == nil {
-		for _, ws := range snapshots {
-			workerStatuses = append(workerStatuses, &agentv1.WorkerStatus{
-				WorkerId:  ws.WorkerID,
-				Status:    ws.Status,
-				TaskId:    ws.TaskID,
-				TableName: ws.TableName,
-				RangeStr:  ws.RangeStr,
-				RowsDone:  ws.RowsDone,
-				TasksDone: ws.TasksDone,
-				TotalRows: ws.TotalRows,
-			})
+	// Deduplicate workers — merge snapshots by worker ID (pick the active one).
+	merged := make(map[string]*agentv1.WorkerStatus, workerCount)
+	for _, ws := range allWorkerStatuses {
+		existing, ok := merged[ws.WorkerId]
+		if !ok || ws.Status == "running" {
+			if ok {
+				// Accumulate totals from previous entry.
+				ws.TasksDone += existing.TasksDone
+				ws.TotalRows += existing.TotalRows
+			}
+			merged[ws.WorkerId] = ws
+		} else {
+			existing.TasksDone += ws.TasksDone
+			existing.TotalRows += ws.TotalRows
+		}
+	}
+	workerStatuses := make([]*agentv1.WorkerStatus, 0, len(merged))
+	for i := 0; i < workerCount; i++ {
+		wid := fmt.Sprintf("worker-%d", i)
+		if ws, ok := merged[wid]; ok {
+			workerStatuses = append(workerStatuses, ws)
 		}
 	}
 
@@ -216,15 +255,15 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 		Payload: &agentv1.ConnectRequest_JobProgress{
 			JobProgress: &agentv1.JobProgress{
 				JobId:          jobID,
-				TotalRows:      rowsCompleted,
+				TotalRows:      totalRows,
 				RowsCompleted:  rowsCompleted,
-				RowsPerSec:     p.RowsPerSec,
+				RowsPerSec:     rowsPerSec,
 				Pct:            pct,
-				TasksTotal:     int32(p.Total),
-				TasksCompleted: int32(p.Completed),
-				TasksRunning:   int32(p.Running),
-				TasksPending:   int32(p.Pending),
-				TasksFailed:    int32(p.Failed),
+				TasksTotal:     int32(totalTasks),
+				TasksCompleted: int32(completedTasks),
+				TasksRunning:   int32(runningTasks),
+				TasksPending:   int32(pendingTasks),
+				TasksFailed:    int32(failedTasks),
 				Timestamp:      timestamppb.Now(),
 				Workers:        workerStatuses,
 			},
