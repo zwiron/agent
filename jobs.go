@@ -100,6 +100,9 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	progressWg.Wait()
 	durationMs := time.Since(startTime).Milliseconds()
 
+	// Send final progress snapshot so Atlas has accurate task/worker counts.
+	a.sendProgressSnapshot(jobID, store, workers)
+
 	// Send final status.
 	if runErr != nil {
 		a.log.Error(ctx, "agent.job.failed", "job_id", jobID, "error", runErr)
@@ -155,9 +158,12 @@ func (a *Agent) handleCancelJob(ctx context.Context, cmd *agentv1.CancelJob) {
 	}
 }
 
-// reportJobProgress periodically reads checkpoint state and sends progress.
+// reportJobProgress sends an immediate snapshot, then periodically reads checkpoint state.
 func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store, workerCount int) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Send first snapshot immediately so Atlas marks the job as running.
+	a.sendProgressSnapshot(jobID, store, workerCount)
+
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -171,55 +177,38 @@ func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store check
 }
 
 func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, workerCount int) {
-	jobs, err := store.ListJobs(context.Background())
+	// Get progress for the specific job, not all checkpoint jobs.
+	p, err := store.JobProgress(context.Background(), jobID)
 	if err != nil {
 		return
 	}
 
+	// Get row count from the job record.
 	var rowsCompleted int64
-	var tasksTotal, tasksCompleted, tasksRunning, tasksPending, tasksFailed int
-	var rowsPerSec float64
-	var jobIDLocal string
-
-	for _, j := range jobs {
-		rowsCompleted += j.TotalRows
-		jobIDLocal = j.ID
-
-		p, err := store.JobProgress(context.Background(), j.ID)
-		if err != nil {
-			continue
-		}
-
-		tasksTotal += int(p.Total)
-		tasksCompleted += int(p.Completed)
-		tasksRunning += int(p.Running)
-		tasksPending += int(p.Pending)
-		tasksFailed += int(p.Failed)
-		rowsPerSec += p.RowsPerSec
+	if j, err := store.GetJob(context.Background(), jobID); err == nil {
+		rowsCompleted = j.TotalRows
 	}
 
 	pct := float64(0)
-	if tasksTotal > 0 {
-		pct = float64(tasksCompleted) / float64(tasksTotal) * 100
+	if p.Total > 0 {
+		pct = float64(p.Completed) / float64(p.Total) * 100
 	}
 
 	// Collect per-worker snapshots.
 	var workerStatuses []*agentv1.WorkerStatus
-	if jobIDLocal != "" {
-		snapshots, err := store.WorkerSnapshots(context.Background(), jobIDLocal, workerCount)
-		if err == nil {
-			for _, ws := range snapshots {
-				workerStatuses = append(workerStatuses, &agentv1.WorkerStatus{
-					WorkerId:  ws.WorkerID,
-					Status:    ws.Status,
-					TaskId:    ws.TaskID,
-					TableName: ws.TableName,
-					RangeStr:  ws.RangeStr,
-					RowsDone:  ws.RowsDone,
-					TasksDone: ws.TasksDone,
-					TotalRows: ws.TotalRows,
-				})
-			}
+	snapshots, err := store.WorkerSnapshots(context.Background(), jobID, workerCount)
+	if err == nil {
+		for _, ws := range snapshots {
+			workerStatuses = append(workerStatuses, &agentv1.WorkerStatus{
+				WorkerId:  ws.WorkerID,
+				Status:    ws.Status,
+				TaskId:    ws.TaskID,
+				TableName: ws.TableName,
+				RangeStr:  ws.RangeStr,
+				RowsDone:  ws.RowsDone,
+				TasksDone: ws.TasksDone,
+				TotalRows: ws.TotalRows,
+			})
 		}
 	}
 
@@ -229,13 +218,13 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 				JobId:          jobID,
 				TotalRows:      rowsCompleted,
 				RowsCompleted:  rowsCompleted,
-				RowsPerSec:     rowsPerSec,
+				RowsPerSec:     p.RowsPerSec,
 				Pct:            pct,
-				TasksTotal:     int32(tasksTotal),
-				TasksCompleted: int32(tasksCompleted),
-				TasksRunning:   int32(tasksRunning),
-				TasksPending:   int32(tasksPending),
-				TasksFailed:    int32(tasksFailed),
+				TasksTotal:     int32(p.Total),
+				TasksCompleted: int32(p.Completed),
+				TasksRunning:   int32(p.Running),
+				TasksPending:   int32(p.Pending),
+				TasksFailed:    int32(p.Failed),
 				Timestamp:      timestamppb.Now(),
 				Workers:        workerStatuses,
 			},

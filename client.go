@@ -114,7 +114,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	return a.recvLoop(ctx)
 }
 
-// heartbeatLoop sends periodic heartbeats to Atlas.
+// heartbeatLoop sends periodic heartbeats to Atlas with system metrics.
 func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -124,10 +124,17 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
 			if err := a.stream.Send(&agentv1.ConnectRequest{
 				Payload: &agentv1.ConnectRequest_Heartbeat{
 					Heartbeat: &agentv1.Heartbeat{
 						Timestamp: timestamppb.Now(),
+						Metrics: &agentv1.SystemMetrics{
+							MemoryUsedMb:  m.Alloc / (1024 * 1024),
+							MemoryTotalMb: m.Sys / (1024 * 1024),
+						},
 					},
 				},
 			}); err != nil {
@@ -157,6 +164,8 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 			a.handleCancelJob(ctx, payload.CancelJob)
 		case *agentv1.ConnectResponse_TestConnection:
 			go a.handleTestConnection(ctx, payload.TestConnection)
+		case *agentv1.ConnectResponse_DiscoverSchema:
+			go a.handleDiscoverSchema(ctx, payload.DiscoverSchema)
 		default:
 			a.log.Warn(ctx, "agent.unknown_command", "type", fmt.Sprintf("%T", msg.GetPayload()))
 		}

@@ -6,7 +6,7 @@ require (
 	github.com/zwiron/connector v0.2.2
 	github.com/zwiron/engine v0.2.0
 	github.com/zwiron/pkg/logger v0.1.0
-	github.com/zwiron/proto/gen/go v0.2.0
+	github.com/zwiron/proto/gen/go v0.3.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.11
 )
