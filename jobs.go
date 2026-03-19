@@ -65,9 +65,6 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 
 	// Build engine config.
 	workers := int(cmd.GetWorkers())
-	if workers <= 0 {
-		workers = 4
-	}
 	maxRetries := int(cmd.GetMaxRetries())
 	if maxRetries <= 0 {
 		maxRetries = 3
@@ -83,19 +80,24 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		MaxRetries:   maxRetries,
 		SyncMode:     cmd.GetSyncMode(),
 		DestSyncMode: cmd.GetDestSyncMode(),
+		OnEvent: func(ev engine.Event) {
+			a.sendJobEvent(jobID, string(ev.Type), ev.Worker, ev.TaskID, ev.Table, ev.Range)
+		},
 	}
 
-	// Start progress reporter in background.
+	// Run the engine.
+	eng := engine.New(store, a.log)
+
+	// Start progress reporter in background. It reads engine result
+	// for metadata (read/write workers, write strategy).
 	progressCtx, progressCancel := context.WithCancel(jobCtx)
 	var progressWg sync.WaitGroup
 	progressWg.Add(1)
 	go func() {
 		defer progressWg.Done()
-		a.reportJobProgress(progressCtx, jobID, store, workers)
+		a.reportJobProgress(progressCtx, jobID, store, eng)
 	}()
 
-	// Run the engine.
-	eng := engine.New(store, a.log)
 	startTime := time.Now()
 	runErr := eng.Run(jobCtx, engineCfg)
 	progressCancel()
@@ -103,7 +105,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	durationMs := time.Since(startTime).Milliseconds()
 
 	// Send final progress snapshot so Atlas has accurate task/worker counts.
-	a.sendProgressSnapshot(jobID, store, workers)
+	a.sendProgressSnapshot(jobID, store, eng)
 
 	// Send final status.
 	if runErr != nil {
@@ -161,9 +163,9 @@ func (a *Agent) handleCancelJob(ctx context.Context, cmd *agentv1.CancelJob) {
 }
 
 // reportJobProgress sends an immediate snapshot, then periodically reads checkpoint state.
-func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store, workerCount int) {
+func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store, eng *engine.Engine) {
 	// Send first snapshot immediately so Atlas marks the job as running.
-	a.sendProgressSnapshot(jobID, store, workerCount)
+	a.sendProgressSnapshot(jobID, store, eng)
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -173,12 +175,17 @@ func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store check
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.sendProgressSnapshot(jobID, store, workerCount)
+			a.sendProgressSnapshot(jobID, store, eng)
 		}
 	}
 }
 
-func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, workerCount int) {
+func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, eng *engine.Engine) {
+	result := eng.Result()
+	workerCount := result.WriteWorkers
+	if workerCount <= 0 {
+		workerCount = 4 // fallback before engine has tuned
+	}
 	// The engine creates one checkpoint job per table with its own ID,
 	// not the Atlas job ID. Aggregate across all checkpoint jobs.
 	cpJobs, err := store.ListJobs(context.Background())
@@ -189,6 +196,7 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 	var totalRows, rowsCompleted int64
 	var totalTasks, completedTasks, runningTasks, pendingTasks, failedTasks int64
 	var rowsPerSec float64
+	var startTime time.Time
 	var allWorkerStatuses []*agentv1.WorkerStatus
 
 	for _, cpJob := range cpJobs {
@@ -204,6 +212,9 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 		totalRows += cpJob.TotalRows
 		rowsCompleted += cpJob.TotalRows
 		rowsPerSec += p.RowsPerSec
+		if startTime.IsZero() || (!cpJob.CreatedAt.IsZero() && cpJob.CreatedAt.Before(startTime)) {
+			startTime = cpJob.CreatedAt
+		}
 
 		snapshots, err := store.WorkerSnapshots(context.Background(), cpJob.ID, workerCount)
 		if err == nil {
@@ -251,6 +262,15 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 		}
 	}
 
+	// Compute average rps since job start.
+	var avgRps float64
+	if !startTime.IsZero() {
+		elapsed := time.Since(startTime).Seconds()
+		if elapsed > 0 {
+			avgRps = float64(rowsCompleted) / elapsed
+		}
+	}
+
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_JobProgress{
 			JobProgress: &agentv1.JobProgress{
@@ -266,6 +286,10 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, worke
 				TasksFailed:    int32(failedTasks),
 				Timestamp:      timestamppb.Now(),
 				Workers:        workerStatuses,
+				ReadWorkers:    int32(result.ReadWorkers),
+				WriteWorkers:   int32(result.WriteWorkers),
+				AvgRps:         avgRps,
+				WriteStrategy:  result.WriteStrategy,
 			},
 		},
 	})

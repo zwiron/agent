@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/zwiron/pkg/logger"
 
@@ -86,7 +87,37 @@ func run(ctx context.Context, log *logger.Logger) error {
 		keys:      keys,
 	}
 
-	return agent.Run(ctx)
+	// Reconnect loop with exponential backoff.
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 60 * time.Second
+		backoffFactor  = 2
+	)
+	backoff := initialBackoff
+
+	for {
+		err := agent.Run(ctx)
+
+		// Clean exit (context cancelled = shutdown signal).
+		if ctx.Err() != nil {
+			log.Info(ctx, "agent.stopped")
+			return nil
+		}
+
+		// Connection failed or dropped — retry with backoff.
+		log.Warn(ctx, "agent.disconnected", "error", err, "retry_in", backoff)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(backoff):
+		}
+
+		backoff *= backoffFactor
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 func defaultDataDir() string {

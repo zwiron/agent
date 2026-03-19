@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -44,7 +46,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		creds := credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+		opts = append(opts, grpc.WithTransportCredentials(creds))
 	}
 
 	a.log.Info(ctx, "agent.connecting", "addr", a.atlasAddr)
