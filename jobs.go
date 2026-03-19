@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -81,7 +80,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		SyncMode:     cmd.GetSyncMode(),
 		DestSyncMode: cmd.GetDestSyncMode(),
 		OnEvent: func(ev engine.Event) {
-			a.sendJobEvent(jobID, string(ev.Type), ev.Worker, ev.TaskID, ev.Table, ev.Range)
+			a.sendJobEvent(jobID, ev)
 		},
 	}
 
@@ -309,23 +308,21 @@ func (a *Agent) sendJobFailed(jobID, errMsg string, rowsCompleted, durationMs in
 	})
 }
 
-func (a *Agent) sendJobEvent(jobID, eventType, worker, taskID, table, rangeStr string) {
-	data, _ := json.Marshal(map[string]string{
-		"job_id":     jobID,
-		"event_type": eventType,
-		"worker":     worker,
-	})
-	_ = data
-
+func (a *Agent) sendJobEvent(jobID string, ev engine.Event) {
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_JobEvent{
 			JobEvent: &agentv1.JobEvent{
 				JobId:     jobID,
-				EventType: eventType,
-				Worker:    worker,
-				TaskId:    taskID,
-				Table:     table,
-				Range:     rangeStr,
+				EventType: string(ev.Type),
+				Worker:    ev.Worker,
+				TaskId:    ev.TaskID,
+				Table:     ev.Table,
+				Range:     ev.Range,
+				Rows:      ev.Rows,
+				ReadMs:    ev.ReadMs,
+				WriteMs:   ev.WriteMs,
+				Error:     ev.Error,
+				Attempt:   int32(ev.Attempt),
 				Timestamp: timestamppb.Now(),
 			},
 		},

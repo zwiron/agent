@@ -41,6 +41,7 @@ require (
 	github.com/zwiron/pkg v0.0.0-20260319101143-6bce76d280df // indirect
 	github.com/zwiron/pkg/errors v0.1.0 // indirect
 	go.opentelemetry.io/otel v1.42.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.42.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect
@@ -53,7 +54,7 @@ require (
 	golang.org/x/text v0.34.0 // indirect
 	golang.org/x/tools v0.42.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
