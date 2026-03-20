@@ -10,6 +10,7 @@ import (
 	"github.com/zwiron/connector"
 	"github.com/zwiron/engine/checkpoint"
 	"github.com/zwiron/engine/engine"
+	"github.com/zwiron/engine/transform"
 	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -79,6 +80,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		MaxRetries:   maxRetries,
 		SyncMode:     cmd.GetSyncMode(),
 		DestSyncMode: cmd.GetDestSyncMode(),
+		Transforms:   protoToTransformSpec(cmd.GetTransforms()),
 		OnEvent: func(ev engine.Event) {
 			a.sendJobEvent(jobID, ev)
 		},
@@ -432,4 +434,34 @@ func (a *Agent) sendJobEvent(jobID string, ev engine.Event) {
 func newJobLogger(base *logger.Logger, jobID string) *logger.Logger {
 	_ = jobID
 	return base
+}
+
+// protoToTransformSpec converts proto TransformRule messages into an engine transform.Spec.
+func protoToTransformSpec(rules []*agentv1.TransformRule) *transform.Spec {
+	if len(rules) == 0 {
+		return nil
+	}
+	spec := &transform.Spec{
+		Tables: make([]transform.TableTransform, 0, len(rules)),
+	}
+	for _, r := range rules {
+		tt := transform.TableTransform{Table: r.GetTable()}
+		for _, c := range r.GetColumns() {
+			tt.Columns = append(tt.Columns, transform.ColumnTransform{
+				Source: c.GetSource(),
+				Dest:   c.GetDest(),
+				Cast:   c.GetCast(),
+				Drop:   c.GetDrop(),
+			})
+		}
+		for _, f := range r.GetFilterConditions() {
+			tt.Filters = append(tt.Filters, transform.FilterCondition{
+				Column: f.GetColumn(),
+				Op:     f.GetOp(),
+				Value:  f.GetValue(),
+			})
+		}
+		spec.Tables = append(spec.Tables, tt)
+	}
+	return spec
 }
