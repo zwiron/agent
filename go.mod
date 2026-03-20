@@ -3,10 +3,10 @@ module github.com/zwiron/agent
 go 1.26.1
 
 require (
-	github.com/zwiron/connector v0.4.0
+	github.com/zwiron/connector v0.5.0
 	github.com/zwiron/engine v0.4.0
 	github.com/zwiron/pkg/logger v0.1.0
-	github.com/zwiron/proto/gen/go v0.5.0
+	github.com/zwiron/proto/gen/go v0.6.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.11
 )
@@ -40,8 +40,9 @@ require (
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	github.com/zwiron/pkg v0.0.0-20260319101143-6bce76d280df // indirect
 	github.com/zwiron/pkg/errors v0.1.0 // indirect
-	go.opentelemetry.io/otel v1.42.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.42.0 // indirect
+	go.opentelemetry.io/otel/metric v1.42.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.42.0 // indirect
+	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.1 // indirect

@@ -142,6 +142,106 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 			},
 		},
 	})
+
+	// Run post-sync row count validation in the background so it doesn't
+	// delay the completed event. Validation results are sent separately.
+	go a.validateJob(ctx, jobID, cmd, srcConfig, dstConfig)
+}
+
+// validateJob opens fresh connections to source and destination, runs
+// SELECT COUNT(*) for each synced table, and sends a JobValidation event.
+func (a *Agent) validateJob(ctx context.Context, jobID string, cmd *agentv1.StartJob, srcConfig, dstConfig connector.Config) {
+	a.log.Info(ctx, "agent.validate.start", "job_id", jobID)
+
+	srcType := connector.ConnectorType(cmd.GetSource().GetConnectorType())
+	dstType := connector.ConnectorType(cmd.GetDest().GetConnectorType())
+
+	// Open source connection.
+	src, err := connector.GetSource(srcType)
+	if err != nil {
+		a.log.Error(ctx, "agent.validate.source_registry", "job_id", jobID, "error", err)
+		return
+	}
+	srcConn, ok := src.(connector.Connection)
+	if !ok {
+		a.log.Error(ctx, "agent.validate.source_not_connection", "job_id", jobID)
+		return
+	}
+	if err := srcConn.Connect(ctx, srcConfig); err != nil {
+		a.log.Error(ctx, "agent.validate.source_connect", "job_id", jobID, "error", err)
+		return
+	}
+	defer srcConn.Close(ctx)
+
+	// Open destination connection.
+	dst, err := connector.GetDestination(dstType)
+	if err != nil {
+		a.log.Error(ctx, "agent.validate.dest_registry", "job_id", jobID, "error", err)
+		return
+	}
+	dstConn, ok := dst.(connector.Connection)
+	if !ok {
+		a.log.Error(ctx, "agent.validate.dest_not_connection", "job_id", jobID)
+		return
+	}
+	if err := dstConn.Connect(ctx, dstConfig); err != nil {
+		a.log.Error(ctx, "agent.validate.dest_connect", "job_id", jobID, "error", err)
+		return
+	}
+	defer dstConn.Close(ctx)
+
+	srcCounter, srcOK := src.(connector.RowCounter)
+	dstCounter, dstOK := dst.(connector.RowCounter)
+	if !srcOK || !dstOK {
+		a.log.Warn(ctx, "agent.validate.no_row_counter", "job_id", jobID, "src", srcOK, "dst", dstOK)
+		return
+	}
+
+	var tables []*agentv1.TableValidation
+	for _, tbl := range cmd.GetTables() {
+		tv := &agentv1.TableValidation{TableName: tbl}
+
+		srcRows, err := srcCounter.RowCount(ctx, tbl)
+		if err != nil {
+			errMsg := err.Error()
+			tv.Error = errMsg
+			tables = append(tables, tv)
+			continue
+		}
+		tv.SourceRows = srcRows
+
+		dstRows, err := dstCounter.RowCount(ctx, tbl)
+		if err != nil {
+			errMsg := err.Error()
+			tv.Error = errMsg
+			tv.SourceRows = srcRows
+			tables = append(tables, tv)
+			continue
+		}
+		tv.DestRows = dstRows
+		tv.Match = srcRows == dstRows
+		tables = append(tables, tv)
+
+		a.log.Info(ctx, "agent.validate.table",
+			"job_id", jobID,
+			"table", tbl,
+			"source_rows", srcRows,
+			"dest_rows", dstRows,
+			"match", tv.Match,
+		)
+	}
+
+	a.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobValidation{
+			JobValidation: &agentv1.JobValidation{
+				JobId:       jobID,
+				Tables:      tables,
+				ValidatedAt: timestamppb.Now(),
+			},
+		},
+	})
+
+	a.log.Info(ctx, "agent.validate.done", "job_id", jobID, "tables", len(tables))
 }
 
 // handleCancelJob cancels a running job.
