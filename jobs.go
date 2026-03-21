@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -86,6 +90,18 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		},
 	}
 
+	// For CDC mode, load previous position for cross-run resumption.
+	cdcKey := cdcPositionKey(cmd)
+	if cmd.GetSyncMode() == "cdc" {
+		if pos, err := a.loadCDCPosition(cdcKey); err == nil && len(pos) > 0 {
+			engineCfg.InitialCDCPosition = pos
+			a.log.Info(ctx, "agent.cdc.resume",
+				"job_id", jobID,
+				"position_bytes", len(pos),
+			)
+		}
+	}
+
 	// Run the engine.
 	eng := engine.New(store, a.log)
 
@@ -144,6 +160,21 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 			},
 		},
 	})
+
+	// Persist CDC position for future runs.
+	if cmd.GetSyncMode() == "cdc" {
+		result := eng.Result()
+		if len(result.FinalCDCPosition) > 0 {
+			if err := a.saveCDCPosition(cdcKey, result.FinalCDCPosition); err != nil {
+				a.log.Error(ctx, "agent.cdc.save_position.error", "error", err)
+			} else {
+				a.log.Info(ctx, "agent.cdc.position_saved",
+					"job_id", jobID,
+					"bytes", len(result.FinalCDCPosition),
+				)
+			}
+		}
+	}
 
 	// Run post-sync row count validation in the background so it doesn't
 	// delay the completed event. Validation results are sent separately.
@@ -464,4 +495,66 @@ func protoToTransformSpec(rules []*agentv1.TransformRule) *transform.Spec {
 		spec.Tables = append(spec.Tables, tt)
 	}
 	return spec
+}
+
+// =========================================================================
+// CDC Position Persistence
+//
+// CDC positions are persisted to a JSON file keyed by a hash of the
+// source + destination connection. This enables resumption across job
+// re-runs (scheduled or manual) without requiring proto changes.
+
+// cdcPositionKey generates a deterministic key for a CDC position based on
+// the source and destination connection identifiers.
+func cdcPositionKey(cmd *agentv1.StartJob) string {
+	h := sha256.New()
+	h.Write([]byte(cmd.GetSource().GetConnectionId()))
+	h.Write([]byte(":"))
+	h.Write([]byte(cmd.GetDest().GetConnectionId()))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// cdcPositionsFile returns the path to the CDC positions JSON file.
+func (a *Agent) cdcPositionsFile() string {
+	return filepath.Join(a.dataDir, "cdc-positions.json")
+}
+
+// loadCDCPositions loads all CDC positions from the persistent store.
+func (a *Agent) loadCDCPositions() (map[string][]byte, error) {
+	data, err := os.ReadFile(a.cdcPositionsFile())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string][]byte), nil
+		}
+		return nil, err
+	}
+	var positions map[string][]byte
+	if err := json.Unmarshal(data, &positions); err != nil {
+		return make(map[string][]byte), nil
+	}
+	return positions, nil
+}
+
+// loadCDCPosition loads a single CDC position by key.
+func (a *Agent) loadCDCPosition(key string) ([]byte, error) {
+	positions, err := a.loadCDCPositions()
+	if err != nil {
+		return nil, err
+	}
+	return positions[key], nil
+}
+
+// saveCDCPosition saves a CDC position to the persistent store.
+func (a *Agent) saveCDCPosition(key string, position []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	positions, _ := a.loadCDCPositions()
+	positions[key] = position
+
+	data, err := json.Marshal(positions)
+	if err != nil {
+		return fmt.Errorf("marshal cdc positions: %w", err)
+	}
+	return os.WriteFile(a.cdcPositionsFile(), data, 0600)
 }

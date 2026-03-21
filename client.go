@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -46,7 +47,18 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		creds := credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+		// Load mTLS client cert+key bundle if previously issued by Atlas.
+		bundlePath := filepath.Join(a.dataDir, "client.pem")
+		if bundle, err := os.ReadFile(bundlePath); err == nil {
+			if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
+				tlsCfg.Certificates = []tls.Certificate{pair}
+				a.log.Info(ctx, "agent.mtls_enabled")
+			}
+		}
+
+		creds := credentials.NewTLS(tlsCfg)
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	}
 
@@ -103,6 +115,16 @@ func (a *Agent) Run(ctx context.Context) error {
 	heartbeatInterval := time.Duration(ack.GetHeartbeatIntervalSec()) * time.Second
 	if heartbeatInterval <= 0 {
 		heartbeatInterval = 10 * time.Second
+	}
+
+	// Store mTLS client certificate + key if provided.
+	if bundle := ack.GetClientCert(); bundle != "" {
+		bundlePath := filepath.Join(a.dataDir, "client.pem")
+		if err := os.WriteFile(bundlePath, []byte(bundle), 0600); err != nil {
+			a.log.Error(ctx, "agent.save_client_cert", "error", err)
+		} else {
+			a.log.Info(ctx, "agent.client_cert_saved", "path", bundlePath)
+		}
 	}
 
 	a.log.Info(ctx, "agent.registered",

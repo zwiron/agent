@@ -70,6 +70,7 @@ require (
 )
 
 replace (
+	github.com/zwiron/connector => ../connector
 	github.com/zwiron/engine => ../engine
 	github.com/zwiron/proto/gen/go => ../proto/gen/go
 )
