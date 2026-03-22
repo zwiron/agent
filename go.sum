@@ -105,6 +105,8 @@ github.com/zwiron/connector v0.6.0 h1:VRTZBBRqiFYvjruD0hjJrSJuPzbGcpJDxmNDB2eJyI
 github.com/zwiron/connector v0.6.0/go.mod h1:OyPjxlfVRwXfDOeyFDkgTQrgQ1Cm7pkMuKNjmRulvbA=
 github.com/zwiron/engine v0.9.0 h1:dFxnSoOndEBUN1HM+m4Py3TA6JXxePm0aocA2NLWk5Y=
 github.com/zwiron/engine v0.9.0/go.mod h1:w3or64W3nG2rEcy9uzlSqo21EgeIAuokQAsJ3/b9Bao=
+github.com/zwiron/engine v0.10.0 h1:pIXh6APpMxqCLeOz2QwMeyCFwYm9CUUukN30VYFxFAs=
+github.com/zwiron/engine v0.10.0/go.mod h1:w3or64W3nG2rEcy9uzlSqo21EgeIAuokQAsJ3/b9Bao=
 github.com/zwiron/pkg v0.0.0-20260319101143-6bce76d280df h1:BWBjv6BO6T7DvGCRHyetLPjaCPyowGVM/tiOmwOLSEw=
 github.com/zwiron/pkg v0.0.0-20260319101143-6bce76d280df/go.mod h1:vHq3OHDdrVkv/T6yUBVw8jmmrWWVeHajk2JlWHfJQyU=
 github.com/zwiron/pkg/errors v0.1.0 h1:dXlHstbmSMSwx3FS+HV4gmF+ai8YimfEnvQyFste/l0=
