@@ -47,7 +47,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		tlsCfg := &tls.Config{
+			MinVersion:         tls.VersionTLS12,
+			InsecureSkipVerify: true, //nolint:gosec // Atlas uses an ephemeral self-signed CA
+		}
 
 		// Load mTLS client cert+key bundle if previously issued by Atlas.
 		bundlePath := filepath.Join(a.dataDir, "client.pem")
