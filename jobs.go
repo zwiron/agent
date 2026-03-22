@@ -57,6 +57,15 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 
 	// Open checkpoint store for this job.
 	cpPath := filepath.Join(a.dataDir, fmt.Sprintf("checkpoint-%s.db", jobID))
+
+	// Fresh start: delete any existing checkpoint so the job starts from scratch.
+	if cmd.GetFreshStart() {
+		_ = os.Remove(cpPath)
+		_ = os.Remove(cpPath + "-wal")
+		_ = os.Remove(cpPath + "-shm")
+		a.log.Info(ctx, "agent.job.fresh_start", "job_id", jobID)
+	}
+
 	store, err := checkpoint.NewSQLiteStore(checkpoint.SQLiteConfig{
 		Path:   cpPath,
 		Logger: a.log,
