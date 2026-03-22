@@ -3,10 +3,10 @@ module github.com/zwiron/agent
 go 1.26.1
 
 require (
-	github.com/zwiron/connector v0.6.0
-	github.com/zwiron/engine v0.11.0
+	github.com/zwiron/connector v0.7.0
+	github.com/zwiron/engine v0.12.0
 	github.com/zwiron/pkg/logger v0.1.0
-	github.com/zwiron/proto/gen/go v0.8.0
+	github.com/zwiron/proto/gen/go v0.9.0
 	google.golang.org/grpc v1.79.2
 	google.golang.org/protobuf v1.36.11
 )

@@ -23,9 +23,11 @@ import (
 // handleStartJob decrypts connection configs and runs the engine.
 func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	jobID := cmd.GetJobId()
+	runID := cmd.GetRunId()
 
 	a.log.Info(ctx, "agent.job.start",
 		"job_id", jobID,
+		"run_id", runID,
 		"tables", cmd.GetTables(),
 		"workers", cmd.GetWorkers(),
 	)
@@ -45,13 +47,13 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	// Decrypt source and destination configs.
 	srcConfig, err := DecryptConfig(a.keys.Private, cmd.GetSource().GetEncryptedConfig())
 	if err != nil {
-		a.sendJobFailed(jobID, fmt.Sprintf("decrypt source config: %v", err), 0, 0)
+		a.sendJobFailed(jobID, runID, fmt.Sprintf("decrypt source config: %v", err), 0, 0)
 		return
 	}
 
 	dstConfig, err := DecryptConfig(a.keys.Private, cmd.GetDest().GetEncryptedConfig())
 	if err != nil {
-		a.sendJobFailed(jobID, fmt.Sprintf("decrypt dest config: %v", err), 0, 0)
+		a.sendJobFailed(jobID, runID, fmt.Sprintf("decrypt dest config: %v", err), 0, 0)
 		return
 	}
 
@@ -71,7 +73,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		Logger: a.log,
 	})
 	if err != nil {
-		a.sendJobFailed(jobID, fmt.Sprintf("open checkpoint: %v", err), 0, 0)
+		a.sendJobFailed(jobID, runID, fmt.Sprintf("open checkpoint: %v", err), 0, 0)
 		return
 	}
 	defer store.Close()
@@ -121,7 +123,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	progressWg.Add(1)
 	go func() {
 		defer progressWg.Done()
-		a.reportJobProgress(progressCtx, jobID, store, eng)
+		a.reportJobProgress(progressCtx, jobID, runID, store, eng)
 	}()
 
 	startTime := time.Now()
@@ -131,12 +133,12 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	durationMs := time.Since(startTime).Milliseconds()
 
 	// Send final progress snapshot so Atlas has accurate task/worker counts.
-	a.sendProgressSnapshot(jobID, store, eng)
+	a.sendProgressSnapshot(jobID, runID, store, eng)
 
 	// Send final status.
 	if runErr != nil {
 		a.log.Error(ctx, "agent.job.failed", "job_id", jobID, "error", runErr)
-		a.sendJobFailed(jobID, runErr.Error(), 0, durationMs)
+		a.sendJobFailed(jobID, runID, runErr.Error(), 0, durationMs)
 		return
 	}
 
@@ -166,6 +168,7 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 				RowsPerSec:  rowsPerSec,
 				DurationMs:  durationMs,
 				CompletedAt: timestamppb.Now(),
+				RunId:       runID,
 			},
 		},
 	})
@@ -304,9 +307,9 @@ func (a *Agent) handleCancelJob(ctx context.Context, cmd *agentv1.CancelJob) {
 }
 
 // reportJobProgress sends an immediate snapshot, then periodically reads checkpoint state.
-func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store checkpoint.Store, eng *engine.Engine) {
+func (a *Agent) reportJobProgress(ctx context.Context, jobID, runID string, store checkpoint.Store, eng *engine.Engine) {
 	// Send first snapshot immediately so Atlas marks the job as running.
-	a.sendProgressSnapshot(jobID, store, eng)
+	a.sendProgressSnapshot(jobID, runID, store, eng)
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -316,12 +319,12 @@ func (a *Agent) reportJobProgress(ctx context.Context, jobID string, store check
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.sendProgressSnapshot(jobID, store, eng)
+			a.sendProgressSnapshot(jobID, runID, store, eng)
 		}
 	}
 }
 
-func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, eng *engine.Engine) {
+func (a *Agent) sendProgressSnapshot(jobID, runID string, store checkpoint.Store, eng *engine.Engine) {
 	result := eng.Result()
 	workerCount := result.WriteWorkers
 	if workerCount <= 0 {
@@ -431,12 +434,13 @@ func (a *Agent) sendProgressSnapshot(jobID string, store checkpoint.Store, eng *
 				WriteWorkers:   int32(result.WriteWorkers),
 				AvgRps:         avgRps,
 				WriteStrategy:  result.WriteStrategy,
+				RunId:          runID,
 			},
 		},
 	})
 }
 
-func (a *Agent) sendJobFailed(jobID, errMsg string, rowsCompleted, durationMs int64) {
+func (a *Agent) sendJobFailed(jobID, runID, errMsg string, rowsCompleted, durationMs int64) {
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_JobFailed{
 			JobFailed: &agentv1.JobFailed{
@@ -445,6 +449,7 @@ func (a *Agent) sendJobFailed(jobID, errMsg string, rowsCompleted, durationMs in
 				RowsCompleted: rowsCompleted,
 				DurationMs:    durationMs,
 				FailedAt:      timestamppb.Now(),
+				RunId:         runID,
 			},
 		},
 	})
