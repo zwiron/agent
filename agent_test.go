@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/json"
+	"encoding/pem"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 
+	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 )
 
@@ -166,4 +172,192 @@ func searchSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func testLogger() *logger.Logger {
+	return logger.New(logger.Config{Level: "error", ServiceName: "test", Format: "json"})
+}
+
+// --------------- Key management tests ---------------
+
+func TestLoadOrGenerateKeys_NewKey(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.key")
+	kp, err := LoadOrGenerateKeys(path, testLogger())
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKeys: %v", err)
+	}
+	if kp == nil {
+		t.Fatal("expected non-nil KeyPair")
+	}
+	if kp.Private == nil {
+		t.Fatal("expected non-nil Private key")
+	}
+	if !contains(kp.PublicPEM, "BEGIN PUBLIC KEY") {
+		t.Fatal("PublicPEM missing header")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("key file not created on disk: %v", err)
+	}
+}
+
+func TestLoadOrGenerateKeys_ExistingKey(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.key")
+
+	kp1, err := LoadOrGenerateKeys(path, testLogger())
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	kp2, err := LoadOrGenerateKeys(path, testLogger())
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if kp1 == nil || kp2 == nil {
+		t.Fatal("expected non-nil key pairs")
+	}
+	if kp1.Private == nil || kp2.Private == nil {
+		t.Fatal("expected non-nil Private keys")
+	}
+}
+
+func TestLoadOrGenerateKeys_Idempotent(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.key")
+
+	kp1, err := LoadOrGenerateKeys(path, testLogger())
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	kp2, err := LoadOrGenerateKeys(path, testLogger())
+	if err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+
+	if kp1.PublicPEM != kp2.PublicPEM {
+		t.Fatal("PublicPEM differs between generate and load")
+	}
+}
+
+func TestLoadKeys_BadPEM(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bad.key")
+	if err := os.WriteFile(path, []byte("not-a-pem-file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadKeys(path)
+	if err == nil {
+		t.Fatal("expected error for bad PEM data")
+	}
+}
+
+func TestLoadKeys_BadDER(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "bad.key")
+	block := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: []byte("garbage")}
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadKeys(path)
+	if err == nil {
+		t.Fatal("expected error for bad DER data")
+	}
+}
+
+// --------------- CDC position persistence tests ---------------
+
+func TestCDCPositions_SaveAndLoad(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+	}
+	if err := a.saveCDCPosition("key1", []byte("pos1")); err != nil {
+		t.Fatalf("saveCDCPosition: %v", err)
+	}
+	got, err := a.loadCDCPosition("key1")
+	if err != nil {
+		t.Fatalf("loadCDCPosition: %v", err)
+	}
+	if !bytes.Equal(got, []byte("pos1")) {
+		t.Fatalf("position = %q, want %q", got, "pos1")
+	}
+}
+
+func TestCDCPositions_LoadNonExistent(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+	}
+	got, err := a.loadCDCPosition("key1")
+	if err != nil {
+		t.Fatalf("loadCDCPosition: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil, got %q", got)
+	}
+}
+
+func TestCDCPositions_MultipleKeys(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+	}
+	if err := a.saveCDCPosition("key1", []byte("pos1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.saveCDCPosition("key2", []byte("pos2")); err != nil {
+		t.Fatal(err)
+	}
+
+	got1, err := a.loadCDCPosition("key1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := a.loadCDCPosition("key2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got1, []byte("pos1")) {
+		t.Fatalf("key1 = %q, want %q", got1, "pos1")
+	}
+	if !bytes.Equal(got2, []byte("pos2")) {
+		t.Fatalf("key2 = %q, want %q", got2, "pos2")
+	}
+}
+
+func TestCDCPositions_Overwrite(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+	}
+	if err := a.saveCDCPosition("key1", []byte("pos1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.saveCDCPosition("key1", []byte("pos2")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := a.loadCDCPosition("key1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("pos2")) {
+		t.Fatalf("key1 = %q, want %q", got, "pos2")
+	}
+}
+
+// --------------- Job logger test ---------------
+
+func TestNewJobLogger(t *testing.T) {
+	t.Parallel()
+	l := newJobLogger(testLogger(), "job-1")
+	if l == nil {
+		t.Fatal("expected non-nil logger")
+	}
 }
