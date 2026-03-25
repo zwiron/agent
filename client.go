@@ -13,6 +13,7 @@ import (
 
 	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -35,6 +36,9 @@ type Agent struct {
 	// Active jobs — keyed by job ID.
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+
+	// Paused state — when true, agent rejects new jobs.
+	paused bool
 }
 
 // Run connects to Atlas, registers, and enters the main command loop.
@@ -43,7 +47,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.cancels = make(map[string]context.CancelFunc)
 
 	// Dial Atlas gRPC.
-	opts := []grpc.DialOption{grpc.WithDefaultCallOptions()}
+	opts := []grpc.DialOption{
+		grpc.WithDefaultCallOptions(),
+		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
+	}
 	if a.insecure {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
@@ -187,6 +194,14 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 
 		switch payload := msg.GetPayload().(type) {
 		case *agentv1.ConnectResponse_StartJob:
+			a.mu.Lock()
+			paused := a.paused
+			a.mu.Unlock()
+			if paused {
+				a.log.Warn(ctx, "agent.job.rejected_paused", "job_id", payload.StartJob.GetJobId())
+				a.sendJobFailed(payload.StartJob.GetJobId(), payload.StartJob.GetRunId(), "agent is paused", 0, 0)
+				continue
+			}
 			go a.handleStartJob(ctx, payload.StartJob)
 		case *agentv1.ConnectResponse_CancelJob:
 			a.handleCancelJob(ctx, payload.CancelJob)
@@ -194,6 +209,10 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 			go a.handleTestConnection(ctx, payload.TestConnection)
 		case *agentv1.ConnectResponse_DiscoverSchema:
 			go a.handleDiscoverSchema(ctx, payload.DiscoverSchema)
+		case *agentv1.ConnectResponse_PauseAgent:
+			a.handlePause(ctx, payload.PauseAgent)
+		case *agentv1.ConnectResponse_ResumeAgent:
+			a.handleResume(ctx)
 		default:
 			a.log.Warn(ctx, "agent.unknown_command", "type", fmt.Sprintf("%T", msg.GetPayload()))
 		}
@@ -205,4 +224,27 @@ func (a *Agent) sendEvent(event *agentv1.ConnectRequest) {
 	if err := a.stream.Send(event); err != nil {
 		a.log.Error(nil, "agent.send.failed", "error", err)
 	}
+}
+
+// handlePause stops all running jobs and marks the agent as paused.
+func (a *Agent) handlePause(ctx context.Context, cmd *agentv1.PauseAgent) {
+	a.log.Info(ctx, "agent.pause", "reason", cmd.GetReason())
+
+	a.mu.Lock()
+	a.paused = true
+	// Cancel all running jobs.
+	for jobID, cancel := range a.cancels {
+		a.log.Info(ctx, "agent.pause.cancel_job", "job_id", jobID)
+		cancel()
+	}
+	a.mu.Unlock()
+}
+
+// handleResume unpauses the agent so it can accept new jobs.
+func (a *Agent) handleResume(ctx context.Context) {
+	a.log.Info(ctx, "agent.resume")
+
+	a.mu.Lock()
+	a.paused = false
+	a.mu.Unlock()
 }

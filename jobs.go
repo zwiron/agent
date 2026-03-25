@@ -17,6 +17,10 @@ import (
 	"github.com/zwiron/engine/transform"
 	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -24,6 +28,18 @@ import (
 func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	jobID := cmd.GetJobId()
 	runID := cmd.GetRunId()
+
+	tracer := otel.Tracer("zwiron.agent")
+	ctx, span := tracer.Start(ctx, "agent.execute_job",
+		trace.WithAttributes(
+			attribute.String("job_id", jobID),
+			attribute.String("run_id", runID),
+			attribute.String("source_type", cmd.GetSource().GetConnectorType()),
+			attribute.String("dest_type", cmd.GetDest().GetConnectorType()),
+			attribute.String("sync_mode", cmd.GetSyncMode()),
+		),
+	)
+	defer span.End()
 
 	a.log.Info(ctx, "agent.job.start",
 		"job_id", jobID,
@@ -45,17 +61,29 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	}()
 
 	// Decrypt source and destination configs.
+	_, decryptSpan := tracer.Start(ctx, "agent.decrypt_config")
 	srcConfig, err := DecryptConfig(a.keys.Private, cmd.GetSource().GetEncryptedConfig())
 	if err != nil {
+		decryptSpan.RecordError(err)
+		decryptSpan.SetStatus(otelcodes.Error, err.Error())
+		decryptSpan.End()
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		a.sendJobFailed(jobID, runID, fmt.Sprintf("decrypt source config: %v", err), 0, 0)
 		return
 	}
 
 	dstConfig, err := DecryptConfig(a.keys.Private, cmd.GetDest().GetEncryptedConfig())
 	if err != nil {
+		decryptSpan.RecordError(err)
+		decryptSpan.SetStatus(otelcodes.Error, err.Error())
+		decryptSpan.End()
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		a.sendJobFailed(jobID, runID, fmt.Sprintf("decrypt dest config: %v", err), 0, 0)
 		return
 	}
+	decryptSpan.End()
 
 	// Open checkpoint store for this job.
 	cpPath := filepath.Join(a.dataDir, fmt.Sprintf("checkpoint-%s.db", jobID))
@@ -138,6 +166,8 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	// Send final status.
 	if runErr != nil {
 		a.log.Error(ctx, "agent.job.failed", "job_id", jobID, "error", runErr)
+		span.RecordError(runErr)
+		span.SetStatus(otelcodes.Error, runErr.Error())
 		a.sendJobFailed(jobID, runID, runErr.Error(), 0, durationMs)
 		return
 	}
@@ -158,6 +188,11 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		"total_rows", totalRows,
 		"duration_ms", durationMs,
 		"rows_per_sec", rowsPerSec,
+	)
+
+	span.SetAttributes(
+		attribute.Int64("total_rows", totalRows),
+		attribute.Int64("duration_ms", durationMs),
 	)
 
 	a.sendEvent(&agentv1.ConnectRequest{
@@ -190,12 +225,23 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 
 	// Run post-sync row count validation in the background so it doesn't
 	// delay the completed event. Validation results are sent separately.
-	go a.validateJob(ctx, jobID, cmd, srcConfig, dstConfig)
+	// Use a detached context with timeout — the job context is about to be
+	// cancelled by the deferred cleanup above, so validation needs its own.
+	valCtx, valCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	go func() {
+		defer valCancel()
+		a.validateJob(valCtx, jobID, cmd, srcConfig, dstConfig)
+	}()
 }
 
 // validateJob opens fresh connections to source and destination, runs
 // SELECT COUNT(*) for each synced table, and sends a JobValidation event.
 func (a *Agent) validateJob(ctx context.Context, jobID string, cmd *agentv1.StartJob, srcConfig, dstConfig connector.Config) {
+	ctx, valSpan := otel.Tracer("zwiron.agent").Start(ctx, "agent.validate_job",
+		trace.WithAttributes(attribute.String("job_id", jobID)),
+	)
+	defer valSpan.End()
+
 	a.log.Info(ctx, "agent.validate.start", "job_id", jobID)
 
 	srcType := connector.ConnectorType(cmd.GetSource().GetConnectorType())

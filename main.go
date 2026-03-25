@@ -11,31 +11,26 @@ import (
 	"time"
 
 	"github.com/zwiron/pkg/logger"
+	"github.com/zwiron/pkg/tracing"
 
 	_ "github.com/zwiron/connector/sql/mysql"
 	_ "github.com/zwiron/connector/sql/postgres"
 )
 
 func main() {
-	log := logger.New(logger.Config{
-		Level:       "info",
-		ServiceName: "agent",
-		Format:      "pretty",
-	})
-
 	ctx := context.Background()
 
-	if err := run(ctx, log); err != nil {
-		log.Error(ctx, "agent.fatal", "error", err)
+	if err := run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "agent fatal: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, log *logger.Logger) error {
+func run(ctx context.Context) error {
 	token := flag.String("token", "", "agent registration token from Atlas dashboard")
 	atlasAddr := flag.String("atlas-addr", "localhost:9090", "Atlas gRPC server address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for keys and checkpoints")
-	insecure := flag.Bool("insecure", false, "use insecure gRPC connection (no TLS)")
+	insecureFlag := flag.Bool("insecure", false, "use insecure gRPC connection (no TLS)")
 	flag.Parse()
 
 	if *token == "" {
@@ -53,10 +48,36 @@ func run(ctx context.Context, log *logger.Logger) error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
+	// -------------------------------------------------------------------------
+	// Tracing
+	// -------------------------------------------------------------------------
+
+	otelHost := os.Getenv("ZWIRON_OTEL_HOST")
+	_, tracingShutdown, err := tracing.Init(tracing.Config{
+		ServiceName:    "agent",
+		ServiceVersion: "develop",
+		Host:           otelHost,
+		Probability:    1.0,
+	})
+	if err != nil {
+		return fmt.Errorf("tracing init: %w", err)
+	}
+	defer tracingShutdown(context.Background())
+
+	// -------------------------------------------------------------------------
+	// Logger (with trace ID injection)
+	// -------------------------------------------------------------------------
+
+	log := logger.NewWithTraceFunc(logger.Config{
+		Level:       "info",
+		ServiceName: "agent",
+		Format:      "pretty",
+	}, tracing.GetTraceID)
+
 	log.Info(ctx, "agent.config",
 		"atlas_addr", *atlasAddr,
 		"data_dir", *dataDir,
-		"insecure", *insecure,
+		"insecure", *insecureFlag,
 	)
 
 	keyPath := filepath.Join(*dataDir, "agent.key")
@@ -82,7 +103,7 @@ func run(ctx context.Context, log *logger.Logger) error {
 		log:       log,
 		token:     *token,
 		atlasAddr: *atlasAddr,
-		insecure:  *insecure,
+		insecure:  *insecureFlag,
 		dataDir:   *dataDir,
 		keys:      keys,
 	}
