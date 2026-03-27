@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -359,5 +360,162 @@ func TestNewJobLogger(t *testing.T) {
 	l := newJobLogger(testLogger(), "job-1")
 	if l == nil {
 		t.Fatal("expected non-nil logger")
+	}
+}
+
+// --------------- Transform conversion tests ---------------
+
+func TestProtoToTransformSpec_MultipleTablesWithFilters(t *testing.T) {
+	t.Parallel()
+	rules := []*agentv1.TransformRule{
+		{
+			Table: "users",
+			Columns: []*agentv1.ColumnMapping{
+				{Source: "email", Dest: "user_email"},
+			},
+		},
+		{
+			Table: "orders",
+			Columns: []*agentv1.ColumnMapping{
+				{Source: "total", Cast: "float64"},
+			},
+			FilterConditions: []*agentv1.FilterCondition{
+				{Column: "status", Op: "=", Value: "active"},
+				{Column: "amount", Op: ">", Value: "100"},
+			},
+		},
+	}
+	spec := protoToTransformSpec(rules)
+	if spec == nil {
+		t.Fatal("expected non-nil spec")
+	}
+	if len(spec.Tables) != 2 {
+		t.Fatalf("tables = %d, want 2", len(spec.Tables))
+	}
+	// First table.
+	if spec.Tables[0].Table != "users" {
+		t.Errorf("table[0] = %q", spec.Tables[0].Table)
+	}
+	if len(spec.Tables[0].Columns) != 1 {
+		t.Fatalf("table[0] columns = %d, want 1", len(spec.Tables[0].Columns))
+	}
+	// Second table with cast and filters.
+	if spec.Tables[1].Columns[0].Cast != "float64" {
+		t.Errorf("table[1] col[0].Cast = %q", spec.Tables[1].Columns[0].Cast)
+	}
+	if len(spec.Tables[1].Filters) != 2 {
+		t.Fatalf("table[1] filters = %d, want 2", len(spec.Tables[1].Filters))
+	}
+	if spec.Tables[1].Filters[0].Op != "=" {
+		t.Errorf("filter[0].Op = %q", spec.Tables[1].Filters[0].Op)
+	}
+	if spec.Tables[1].Filters[1].Op != ">" {
+		t.Errorf("filter[1].Op = %q", spec.Tables[1].Filters[1].Op)
+	}
+}
+
+func TestProtoToTransformSpec_DropAndHash(t *testing.T) {
+	t.Parallel()
+	rules := []*agentv1.TransformRule{
+		{
+			Table: "users",
+			Columns: []*agentv1.ColumnMapping{
+				{Source: "ssn", Drop: true},
+				{Source: "id"},
+			},
+		},
+	}
+	spec := protoToTransformSpec(rules)
+	if spec == nil {
+		t.Fatal("expected non-nil spec")
+	}
+	if !spec.Tables[0].Columns[0].Drop {
+		t.Error("col[0].Drop should be true")
+	}
+	if spec.Tables[0].Columns[1].Drop {
+		t.Error("col[1].Drop should be false")
+	}
+}
+
+// --------------- HandleCancelJob tests ---------------
+
+func TestHandleCancelJob_ExistingJob(t *testing.T) {
+	t.Parallel()
+	var cancelled bool
+	a := &Agent{
+		log:     testLogger(),
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+		cancels: map[string]context.CancelFunc{
+			"job-1": func() { cancelled = true },
+		},
+	}
+	a.handleCancelJob(context.Background(), &agentv1.CancelJob{
+		JobId:  "job-1",
+		Reason: "user requested",
+	})
+	if !cancelled {
+		t.Fatal("expected cancel function to be called")
+	}
+}
+
+func TestHandleCancelJob_NonExistentJob(t *testing.T) {
+	t.Parallel()
+	a := &Agent{
+		log:     testLogger(),
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+		cancels: map[string]context.CancelFunc{},
+	}
+	// Should not panic.
+	a.handleCancelJob(context.Background(), &agentv1.CancelJob{
+		JobId:  "nonexistent",
+		Reason: "test",
+	})
+}
+
+// --------------- CDC position key edge cases ---------------
+
+func TestCdcPositionKey_EmptyInputs(t *testing.T) {
+	t.Parallel()
+	cmd := &agentv1.StartJob{
+		Source: &agentv1.EncryptedConnection{ConnectionId: ""},
+		Dest:   &agentv1.EncryptedConnection{ConnectionId: ""},
+	}
+	k := cdcPositionKey(cmd)
+	if len(k) != 16 {
+		t.Fatalf("key len = %d, want 16", len(k))
+	}
+}
+
+func TestCdcPositionKey_NilConnections(t *testing.T) {
+	t.Parallel()
+	cmd := &agentv1.StartJob{}
+	k := cdcPositionKey(cmd)
+	if len(k) != 16 {
+		t.Fatalf("key len = %d, want 16", len(k))
+	}
+}
+
+// --------------- Pause / Resume ---------------
+
+func TestHandlePause_CancelsRunningJobs(t *testing.T) {
+	t.Parallel()
+	var cancelled1, cancelled2 bool
+	a := &Agent{
+		log:     testLogger(),
+		dataDir: t.TempDir(),
+		mu:      sync.Mutex{},
+		cancels: map[string]context.CancelFunc{
+			"job-1": func() { cancelled1 = true },
+			"job-2": func() { cancelled2 = true },
+		},
+	}
+	a.handlePause(context.Background(), &agentv1.PauseAgent{Reason: "maintenance"})
+	if !cancelled1 || !cancelled2 {
+		t.Fatal("expected both jobs to be cancelled")
+	}
+	if !a.paused {
+		t.Fatal("expected agent to be paused")
 	}
 }
