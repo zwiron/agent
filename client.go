@@ -213,6 +213,10 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 			a.handlePause(ctx, payload.PauseAgent)
 		case *agentv1.ConnectResponse_ResumeAgent:
 			a.handleResume(ctx)
+		case *agentv1.ConnectResponse_TriggerValidation:
+			cmd := payload.TriggerValidation
+			a.log.Info(ctx, "agent.trigger_validation", "job_id", cmd.GetJobId())
+			go a.runOnDemandValidation(ctx, cmd.GetJobId(), cmd.GetRunId(), cmd)
 		default:
 			a.log.Warn(ctx, "agent.unknown_command", "type", fmt.Sprintf("%T", msg.GetPayload()))
 		}
