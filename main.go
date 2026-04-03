@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -108,7 +109,7 @@ func run(ctx context.Context) error {
 		keys:      keys,
 	}
 
-	// Reconnect loop with exponential backoff.
+	// Reconnect loop with exponential backoff + jitter.
 	const (
 		initialBackoff = 1 * time.Second
 		maxBackoff     = 60 * time.Second
@@ -117,6 +118,7 @@ func run(ctx context.Context) error {
 	backoff := initialBackoff
 
 	for {
+		connStart := time.Now()
 		err := agent.Run(ctx)
 
 		// Clean exit (context cancelled = shutdown signal).
@@ -125,13 +127,21 @@ func run(ctx context.Context) error {
 			return nil
 		}
 
-		// Connection failed or dropped — retry with backoff.
-		log.Warn(ctx, "agent.disconnected", "error", err, "retry_in", backoff)
+		// If the connection was stable for >30s, reset backoff on next failure.
+		if time.Since(connStart) > 30*time.Second {
+			backoff = initialBackoff
+		}
+
+		// Add jitter: backoff ± 25% to prevent thundering herd.
+		jitter := time.Duration(rand.Int64N(int64(backoff / 2)))
+		wait := backoff + jitter - backoff/4
+
+		log.Warn(ctx, "agent.disconnected", "error", err, "retry_in", wait)
 
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
 
 		backoff *= backoffFactor

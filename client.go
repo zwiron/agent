@@ -180,14 +180,23 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// errStreamClosed is returned when the server closes the stream (EOF).
+// This is distinct from a context cancellation (clean shutdown) and triggers
+// the reconnect loop in main.go.
+var errStreamClosed = fmt.Errorf("stream closed by server")
+
 // recvLoop reads commands from Atlas and dispatches them.
 func (a *Agent) recvLoop(ctx context.Context) error {
 	for {
 		msg, err := a.stream.Recv()
 		if err != nil {
-			if err == io.EOF || ctx.Err() != nil {
-				a.log.Info(ctx, "agent.stream.closed")
-				return nil
+			if ctx.Err() != nil {
+				a.log.Info(ctx, "agent.stream.closed", "reason", "shutdown")
+				return nil // Clean shutdown — don't reconnect.
+			}
+			if err == io.EOF {
+				a.log.Warn(ctx, "agent.stream.closed", "reason", "server_eof")
+				return errStreamClosed // Trigger reconnect.
 			}
 			return fmt.Errorf("recv: %w", err)
 		}

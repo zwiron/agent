@@ -51,6 +51,12 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	// Create a cancellable context for this job.
 	jobCtx, jobCancel := context.WithCancel(ctx)
 	a.mu.Lock()
+	if _, alreadyRunning := a.cancels[jobID]; alreadyRunning {
+		a.mu.Unlock()
+		jobCancel()
+		a.log.Warn(ctx, "agent.job.already_running", "job_id", jobID)
+		return
+	}
 	a.cancels[jobID] = jobCancel
 	a.mu.Unlock()
 	defer func() {
