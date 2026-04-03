@@ -3,11 +3,11 @@ module github.com/zwiron/agent
 go 1.26.1
 
 require (
-	github.com/zwiron/connector v0.8.0
-	github.com/zwiron/engine v0.14.0
+	github.com/zwiron/connector v1.1.5
+	github.com/zwiron/engine v0.14.10
 	github.com/zwiron/pkg/logger v0.1.0
 	github.com/zwiron/pkg/tracing v0.1.0
-	github.com/zwiron/proto/gen/go v0.10.0
+	github.com/zwiron/proto/gen/go v0.12.0
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0
 	go.opentelemetry.io/otel v1.42.0
 	go.opentelemetry.io/otel/trace v1.42.0
@@ -28,6 +28,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-mysql-org/go-mysql v1.14.0 // indirect
 	github.com/go-sql-driver/mysql v1.9.3 // indirect
+	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
@@ -41,6 +42,7 @@ require (
 	github.com/klauspost/asmfmt v1.3.2 // indirect
 	github.com/klauspost/compress v1.18.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
+	github.com/marcboeker/go-duckdb v1.8.5 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/minio/asm2plan9s v0.0.0-20200509001527-cdd76441f9d8 // indirect
 	github.com/minio/c2goasm v0.0.0-20190812172519-36a3d3bbc4f3 // indirect

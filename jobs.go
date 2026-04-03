@@ -126,6 +126,11 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		Transforms:   protoToTransformSpec(cmd.GetTransforms()),
 		OnEvent: func(ev engine.Event) {
 			a.sendJobEvent(jobID, ev)
+
+			// Forward full schema proposals to Atlas via gRPC.
+			if ev.ProposalID != "" {
+				a.forwardSchemaProposal(jobID, runID, ev, store)
+			}
 		},
 	}
 
@@ -520,6 +525,52 @@ func (a *Agent) sendJobEvent(jobID string, ev engine.Event) {
 			},
 		},
 	})
+}
+
+// forwardSchemaProposal reads a proposal from the local checkpoint store
+// and sends the full payload to Atlas via a ConnectRequest_SchemaProposal
+// message. This bridges the gap between engine-local proposals and the
+// Atlas schema_proposals table shown in the UI.
+func (a *Agent) forwardSchemaProposal(jobID, runID string, ev engine.Event, store *checkpoint.SQLiteStore) {
+	ctx := context.Background()
+	proposal, err := store.GetProposal(ctx, ev.ProposalID)
+	if err != nil {
+		a.log.Error(ctx, "agent.schema_proposal.read_error",
+			"job_id", jobID, "proposal_id", ev.ProposalID, "error", err)
+		return
+	}
+	if proposal == nil {
+		a.log.Warn(ctx, "agent.schema_proposal.not_found",
+			"job_id", jobID, "proposal_id", ev.ProposalID)
+		return
+	}
+
+	autoApplied := ev.Type == engine.EventSchemaAutoApplied
+	status := "pending"
+	if autoApplied {
+		status = "auto_applied"
+	}
+
+	a.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_SchemaProposal{
+			SchemaProposal: &agentv1.SchemaChangeProposal{
+				ProposalId:    proposal.ID,
+				JobId:         jobID,
+				RunId:         runID,
+				TableName:     proposal.TableName,
+				Status:        status,
+				ChangesJson:   proposal.ChangesJSON,
+				OldSchemaJson: proposal.OldSchemaJSON,
+				NewSchemaJson: proposal.NewSchemaJSON,
+				AutoApplied:   autoApplied,
+				CreatedAt:     timestamppb.New(proposal.CreatedAt),
+			},
+		},
+	})
+
+	a.log.Info(ctx, "agent.schema_proposal.forwarded",
+		"job_id", jobID, "proposal_id", proposal.ID,
+		"table", proposal.TableName, "status", status)
 }
 
 func newJobLogger(base *logger.Logger, jobID string) *logger.Logger {
