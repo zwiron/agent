@@ -32,6 +32,8 @@ func run(ctx context.Context) error {
 	atlasAddr := flag.String("atlas-addr", "localhost:9090", "Atlas gRPC server address")
 	dataDir := flag.String("data-dir", defaultDataDir(), "directory for keys and checkpoints")
 	insecureFlag := flag.Bool("insecure", false, "use insecure gRPC connection (no TLS)")
+	maxJobs := flag.Int("max-concurrent-jobs", 0, "maximum concurrent jobs (0 = unlimited)")
+	metricsPort := flag.String("metrics-port", "9091", "port for Prometheus /metrics endpoint (0 = disabled)")
 	flag.Parse()
 
 	if *token == "" {
@@ -43,6 +45,12 @@ func run(ctx context.Context) error {
 
 	if envAddr := os.Getenv("ZWIRON_ATLAS_ADDR"); envAddr != "" && *atlasAddr == "localhost:9090" {
 		*atlasAddr = envAddr
+	}
+
+	if envMaxJobs := os.Getenv("ZWIRON_MAX_CONCURRENT_JOBS"); envMaxJobs != "" && *maxJobs == 0 {
+		if n, err := fmt.Sscanf(envMaxJobs, "%d", maxJobs); n != 1 || err != nil {
+			return fmt.Errorf("invalid ZWIRON_MAX_CONCURRENT_JOBS: %s", envMaxJobs)
+		}
 	}
 
 	if err := os.MkdirAll(*dataDir, 0700); err != nil {
@@ -89,6 +97,9 @@ func run(ctx context.Context) error {
 
 	log.Info(ctx, "agent.keys.ready", "path", keyPath)
 
+	// Initialize Prometheus metrics.
+	agentMetrics := NewAgentMetrics()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -107,6 +118,19 @@ func run(ctx context.Context) error {
 		insecure:  *insecureFlag,
 		dataDir:   *dataDir,
 		keys:      keys,
+		maxJobs:   *maxJobs,
+		metrics:   agentMetrics,
+	}
+
+	// Initialize job concurrency semaphore.
+	if agent.maxJobs > 0 {
+		agent.jobSem = make(chan struct{}, agent.maxJobs)
+		log.Info(ctx, "agent.concurrency_limit", "max_concurrent_jobs", agent.maxJobs)
+	}
+
+	// Start Prometheus metrics server.
+	if *metricsPort != "0" {
+		StartMetricsServer(ctx, log, agentMetrics, *metricsPort)
 	}
 
 	// Reconnect loop with exponential backoff + jitter.

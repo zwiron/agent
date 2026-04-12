@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -29,7 +30,36 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	jobID := cmd.GetJobId()
 	runID := cmd.GetRunId()
 
+	// Enforce concurrency limit if configured.
+	if a.jobSem != nil {
+		select {
+		case a.jobSem <- struct{}{}:
+			defer func() { <-a.jobSem }()
+		default:
+			a.log.Warn(ctx, "agent.job.rejected_concurrency_limit",
+				"job_id", jobID,
+				"max_jobs", a.maxJobs,
+			)
+			a.sendJobFailed(jobID, runID, fmt.Sprintf("agent at concurrency limit (%d)", a.maxJobs), 0, 0)
+			return
+		}
+	}
+
+	// Track metrics.
+	if a.metrics != nil {
+		a.metrics.JobsRunning.Inc()
+		a.metrics.JobsTotal.Inc()
+		defer a.metrics.JobsRunning.Dec()
+	}
+
 	tracer := otel.Tracer("zwiron.agent")
+
+	// Continue the trace from Atlas scheduler if traceparent was provided.
+	if tp := cmd.GetTraceParent(); tp != "" {
+		carrier := propagation.MapCarrier{"traceparent": tp}
+		ctx = otel.GetTextMapPropagator().Extract(ctx, carrier)
+	}
+
 	ctx, span := tracer.Start(ctx, "agent.execute_job",
 		trace.WithAttributes(
 			attribute.String("job_id", jobID),
@@ -171,6 +201,11 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	progressWg.Wait()
 	durationMs := time.Since(startTime).Milliseconds()
 
+	// Record job duration metric.
+	if a.metrics != nil {
+		a.metrics.JobDuration.Observe(float64(durationMs) / 1000.0)
+	}
+
 	// Send final progress snapshot so Atlas has accurate task/worker counts.
 	a.sendProgressSnapshot(jobID, runID, store, eng)
 
@@ -179,6 +214,9 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		a.log.Error(ctx, "agent.job.failed", "job_id", jobID, "error", runErr)
 		span.RecordError(runErr)
 		span.SetStatus(otelcodes.Error, runErr.Error())
+		if a.metrics != nil {
+			a.metrics.JobsFailed.Inc()
+		}
 		a.sendJobFailed(jobID, runID, runErr.Error(), 0, durationMs)
 		return
 	}
@@ -200,6 +238,10 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		"duration_ms", durationMs,
 		"rows_per_sec", rowsPerSec,
 	)
+
+	if a.metrics != nil {
+		a.metrics.RowsTotal.Add(float64(totalRows))
+	}
 
 	span.SetAttributes(
 		attribute.Int64("total_rows", totalRows),

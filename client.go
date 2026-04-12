@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,7 @@ type Agent struct {
 	// Runtime state — set after successful registration.
 	agentID string
 	stream  agentv1.AgentService_ConnectClient
+	sendMu  sync.Mutex // Serializes all stream.Send() calls (gRPC streams are not goroutine-safe).
 
 	// Active jobs — keyed by job ID.
 	mu      sync.Mutex
@@ -39,6 +41,16 @@ type Agent struct {
 
 	// Paused state — when true, agent rejects new jobs.
 	paused bool
+
+	// Concurrency limit — max simultaneous jobs (0 = unlimited).
+	maxJobs int
+	jobSem  chan struct{}
+
+	// Atlas CA certificate PEM — received in RegistrationAck and pinned for TLS.
+	atlasCAPEM string
+
+	// Prometheus metrics.
+	metrics *AgentMetrics
 }
 
 // Run connects to Atlas, registers, and enters the main command loop.
@@ -55,8 +67,21 @@ func (a *Agent) Run(ctx context.Context) error {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else {
 		tlsCfg := &tls.Config{
-			MinVersion:         tls.VersionTLS12,
-			InsecureSkipVerify: true, //nolint:gosec // Atlas uses an ephemeral self-signed CA
+			MinVersion: tls.VersionTLS12,
+		}
+
+		// Load pinned Atlas CA cert if available (received in previous RegistrationAck).
+		caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
+		if caPEM, err := os.ReadFile(caPath); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(caPEM) {
+				tlsCfg.RootCAs = pool
+				a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
+			}
+		} else {
+			// First connection — no pinned CA yet. Use system trust store.
+			// The RegistrationAck will send us the CA cert to pin for future connections.
+			a.log.Info(ctx, "agent.tls.system_ca", "msg", "no pinned CA, using system trust store")
 		}
 
 		// Load mTLS client cert+key bundle if previously issued by Atlas.
@@ -137,6 +162,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 
+	// Pin Atlas CA certificate for TLS verification on future connections.
+	if caPEM := ack.GetCaCert(); caPEM != "" {
+		caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
+		if err := os.WriteFile(caPath, []byte(caPEM), 0600); err != nil {
+			a.log.Error(ctx, "agent.save_ca_cert", "error", err)
+		} else {
+			a.log.Info(ctx, "agent.ca_cert_pinned", "path", caPath)
+		}
+	}
+
 	a.log.Info(ctx, "agent.registered",
 		"agent_id", a.agentID,
 		"heartbeat_interval", heartbeatInterval,
@@ -162,7 +197,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
 
-			if err := a.stream.Send(&agentv1.ConnectRequest{
+			a.sendMu.Lock()
+			err := a.stream.Send(&agentv1.ConnectRequest{
 				Payload: &agentv1.ConnectRequest_Heartbeat{
 					Heartbeat: &agentv1.Heartbeat{
 						Timestamp: timestamppb.Now(),
@@ -170,9 +206,13 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 							MemoryUsedMb:  m.Alloc / (1024 * 1024),
 							MemoryTotalMb: m.Sys / (1024 * 1024),
 						},
+						JobsRunning: int32(len(a.jobSem)),
+						MaxJobs:     int32(a.maxJobs),
 					},
 				},
-			}); err != nil {
+			})
+			a.sendMu.Unlock()
+			if err != nil {
 				a.log.Error(ctx, "agent.heartbeat.failed", "error", err)
 				return
 			}
@@ -233,8 +273,13 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 }
 
 // sendEvent is a helper to send a message back to Atlas.
+// All stream.Send() calls are serialized through sendMu because
+// gRPC ClientStream.Send() is not goroutine-safe.
 func (a *Agent) sendEvent(event *agentv1.ConnectRequest) {
-	if err := a.stream.Send(event); err != nil {
+	a.sendMu.Lock()
+	err := a.stream.Send(event)
+	a.sendMu.Unlock()
+	if err != nil {
 		a.log.Error(nil, "agent.send.failed", "error", err)
 	}
 }
