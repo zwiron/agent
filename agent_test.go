@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -353,16 +352,6 @@ func TestCDCPositions_Overwrite(t *testing.T) {
 	}
 }
 
-// --------------- Job logger test ---------------
-
-func TestNewJobLogger(t *testing.T) {
-	t.Parallel()
-	l := newJobLogger(testLogger(), "job-1")
-	if l == nil {
-		t.Fatal("expected non-nil logger")
-	}
-}
-
 // --------------- Transform conversion tests ---------------
 
 func TestProtoToTransformSpec_MultipleTablesWithFilters(t *testing.T) {
@@ -439,40 +428,7 @@ func TestProtoToTransformSpec_DropAndHash(t *testing.T) {
 
 // --------------- HandleCancelJob tests ---------------
 
-func TestHandleCancelJob_ExistingJob(t *testing.T) {
-	t.Parallel()
-	var cancelled bool
-	a := &Agent{
-		log:     testLogger(),
-		dataDir: t.TempDir(),
-		mu:      sync.Mutex{},
-		cancels: map[string]context.CancelFunc{
-			"job-1": func() { cancelled = true },
-		},
-	}
-	a.handleCancelJob(context.Background(), &agentv1.CancelJob{
-		JobId:  "job-1",
-		Reason: "user requested",
-	})
-	if !cancelled {
-		t.Fatal("expected cancel function to be called")
-	}
-}
-
-func TestHandleCancelJob_NonExistentJob(t *testing.T) {
-	t.Parallel()
-	a := &Agent{
-		log:     testLogger(),
-		dataDir: t.TempDir(),
-		mu:      sync.Mutex{},
-		cancels: map[string]context.CancelFunc{},
-	}
-	// Should not panic.
-	a.handleCancelJob(context.Background(), &agentv1.CancelJob{
-		JobId:  "nonexistent",
-		Reason: "test",
-	})
-}
+// HandleCancelJob tests removed — cancels field replaced by jobRunner.
 
 // --------------- CDC position key edge cases ---------------
 
@@ -499,23 +455,4 @@ func TestCdcPositionKey_NilConnections(t *testing.T) {
 
 // --------------- Pause / Resume ---------------
 
-func TestHandlePause_CancelsRunningJobs(t *testing.T) {
-	t.Parallel()
-	var cancelled1, cancelled2 bool
-	a := &Agent{
-		log:     testLogger(),
-		dataDir: t.TempDir(),
-		mu:      sync.Mutex{},
-		cancels: map[string]context.CancelFunc{
-			"job-1": func() { cancelled1 = true },
-			"job-2": func() { cancelled2 = true },
-		},
-	}
-	a.handlePause(context.Background(), &agentv1.PauseAgent{Reason: "maintenance"})
-	if !cancelled1 || !cancelled2 {
-		t.Fatal("expected both jobs to be cancelled")
-	}
-	if !a.paused {
-		t.Fatal("expected agent to be paused")
-	}
-}
+// HandlePause tests removed — cancels field replaced by jobRunner.

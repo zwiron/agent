@@ -4,11 +4,11 @@ go 1.26.1
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	github.com/zwiron/connector v1.1.14
-	github.com/zwiron/engine v0.14.20
+	github.com/zwiron/connector v1.1.15
+	github.com/zwiron/engine v0.14.22
 	github.com/zwiron/pkg/logger v0.1.0
 	github.com/zwiron/pkg/tracing v0.1.0
-	github.com/zwiron/proto/gen/go v0.12.3
+	github.com/zwiron/proto/gen/go v0.12.4
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0
 	go.opentelemetry.io/otel v1.42.0
 	go.opentelemetry.io/otel/trace v1.42.0

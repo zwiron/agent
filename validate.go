@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/zwiron/connector"
+	"github.com/zwiron/engine/validation"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -15,10 +15,41 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+// defaultMaxDiffRows is no longer used — we count diffs but never store row data.
+// const defaultMaxDiffRows = 10_000
+
+// validationRuns tracks running validation contexts for cancellation.
+var validationRuns sync.Map // map[string]context.CancelFunc keyed by "jobID:runID"
+
+// cancelValidation cancels a running validation identified by jobID + runID.
+func (a *Agent) cancelValidation(ctx context.Context, cmd *agentv1.CancelValidation) {
+	key := cmd.GetJobId() + ":" + cmd.GetRunId()
+	if cancel, ok := validationRuns.LoadAndDelete(key); ok {
+		cancel.(context.CancelFunc)()
+		a.log.Info(ctx, "agent.validation.cancelled", "job_id", cmd.GetJobId(), "run_id", cmd.GetRunId(), "reason", cmd.GetReason())
+	}
+}
+
 // runOnDemandValidation executes the four-layer validation orchestrator.
 // It is triggered by the TriggerValidation command from Atlas.
 func (a *Agent) runOnDemandValidation(ctx context.Context, jobID, runID string, cmd *agentv1.TriggerValidation) {
 	tracer := otel.Tracer("zwiron.agent")
+
+	// Apply timeout if specified.
+	if timeout := cmd.GetTimeoutSeconds(); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+
+	// Register for cancellation.
+	cancelCtx, cancelFn := context.WithCancel(ctx)
+	defer cancelFn()
+	key := jobID + ":" + runID
+	validationRuns.Store(key, cancelFn)
+	defer validationRuns.Delete(key)
+	ctx = cancelCtx
+
 	ctx, span := tracer.Start(ctx, "agent.on_demand_validation",
 		trace.WithAttributes(
 			attribute.String("job_id", jobID),
@@ -30,11 +61,15 @@ func (a *Agent) runOnDemandValidation(ctx context.Context, jobID, runID string, 
 
 	start := time.Now()
 	tables := cmd.GetTables()
+	transformSpec := protoToTransformSpec(cmd.GetTransforms())
+	hasTransforms := transformSpec != nil && !transformSpec.IsEmpty()
 
 	a.log.Info(ctx, "agent.validation.start",
 		"job_id", jobID,
 		"run_id", runID,
 		"tables", tables,
+		"transform_aware", hasTransforms,
+		"validation_mode", cmd.GetValidationMode(),
 	)
 
 	a.sendValidationProgress(jobID, runID, "running", 0, int32(len(tables)))
@@ -90,30 +125,75 @@ func (a *Agent) runOnDemandValidation(ctx context.Context, jobID, runID string, 
 	}
 	defer dstConn.Close(ctx)
 
-	// Layer 1: Structural validation (row counts).
-	structural := a.validateStructural(ctx, jobID, src, dst, tables)
+	// Check for cancellation before starting layers.
+	if ctx.Err() != nil {
+		a.sendValidationError(jobID, runID, fmt.Errorf("validation cancelled before start: %w", ctx.Err()))
+		return
+	}
+
+	// Layer 1: Structural validation (row counts — transform-aware).
+	structuralRes := validation.ValidateStructural(ctx, src, dst, tables, transformSpec)
+	if ctx.Err() != nil {
+		a.sendValidationError(jobID, runID, fmt.Errorf("cancelled during structural: %w", ctx.Err()))
+		return
+	}
+	for _, r := range structuralRes {
+		a.log.Info(ctx, "agent.validation.structural",
+			"job_id", jobID, "table", r.Table,
+			"source_rows", r.SourceRows, "dest_rows", r.DestRows,
+			"match", r.Match, "has_filters", r.HasFilters,
+		)
+	}
 	a.sendValidationProgress(jobID, runID, "structural_done", 20, int32(len(tables)))
 
-	// Layer 2: Content validation (full-table checksums + row diffs).
-	content, diffs := a.validateContentFull(ctx, jobID, src, dst, tables)
+	// Layer 2: Content validation (checksums + diff COUNTS only — no row data leaves).
+	contentRes := validation.ValidateContent(ctx, src, dst, tables)
+	if ctx.Err() != nil {
+		a.sendValidationError(jobID, runID, fmt.Errorf("cancelled during content: %w", ctx.Err()))
+		return
+	}
+	for _, r := range contentRes {
+		a.log.Info(ctx, "agent.validation.content",
+			"job_id", jobID, "table", r.Table,
+			"match", r.Match, "diff_rows", r.DiffCount,
+		)
+	}
 	a.sendValidationProgress(jobID, runID, "content_done", 50, int32(len(tables)))
 
-	// Layer 3: Schema comparison.
-	schemas := a.validateSchema(ctx, jobID, src, dst, tables)
+	// Layer 3: Schema comparison (transform-aware — accounts for renames, drops, casts, computed).
+	schemaRes := validation.ValidateSchema(ctx, src, dst, tables, transformSpec, cmd.GetDestSchema())
+	if ctx.Err() != nil {
+		a.sendValidationError(jobID, runID, fmt.Errorf("cancelled during schema: %w", ctx.Err()))
+		return
+	}
+	for _, r := range schemaRes {
+		a.log.Info(ctx, "agent.validation.schema",
+			"job_id", jobID, "table", r.Table,
+			"match", r.Match, "diffs", len(r.Diffs),
+		)
+	}
 	a.sendValidationProgress(jobID, runID, "schema_done", 65, int32(len(tables)))
 
 	// Layer 4: Semantic validation (user-defined assertions).
-	semantic := a.validateSemantic(ctx, jobID, src, dst, tables, cmd.GetSemanticRules())
-	a.sendValidationProgress(jobID, runID, "semantic_done", 80, int32(len(tables)))
-
-	// Data profiling (bonus layer attached to the report).
-	profiles := a.profileData(ctx, jobID, src, dst, tables)
-	a.sendValidationProgress(jobID, runID, "profiling_done", 90, int32(len(tables)))
+	semanticRules := toSharedSemanticRules(cmd.GetSemanticRules())
+	semanticRes := validation.ValidateSemantic(ctx, src, dst, semanticRules)
+	if ctx.Err() != nil {
+		a.sendValidationError(jobID, runID, fmt.Errorf("cancelled during semantic: %w", ctx.Err()))
+		return
+	}
+	for _, r := range semanticRes {
+		a.log.Info(ctx, "agent.validation.semantic",
+			"job_id", jobID, "rule", r.RuleName, "passed", r.Passed,
+		)
+	}
+	a.sendValidationProgress(jobID, runID, "semantic_done", 90, int32(len(tables)))
 
 	// Build and send report.
-	report := buildValidationReport(jobID, runID, structural, content, schemas, semantic, diffs, profiles)
+	report := buildValidationReport(jobID, runID, structuralRes, contentRes, schemaRes, semanticRes)
 	report.DurationMs = time.Since(start).Milliseconds()
 	report.ValidatedAt = timestamppb.Now()
+	report.ValidationMode = cmd.GetValidationMode()
+	report.TransformAware = hasTransforms
 
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_ValidationReport{
@@ -128,540 +208,144 @@ func (a *Agent) runOnDemandValidation(ctx context.Context, jobID, runID string, 
 		"run_id", runID,
 		"duration_ms", report.DurationMs,
 		"overall_accuracy", report.OverallAccuracy,
+		"transform_aware", hasTransforms,
 	)
 }
 
 // ---------------------------------------------------------------------------
-// Layer 1: Structural (row counts)
+// Proto converters — shared results → proto types
 // ---------------------------------------------------------------------------
 
-func (a *Agent) validateStructural(ctx context.Context, jobID string, src connector.Source, dst interface{}, tables []string) []*agentv1.TableValidation {
-	srcCounter, srcOK := src.(connector.RowCounter)
-	dstCounter, dstOK := dst.(connector.RowCounter)
-
-	var results []*agentv1.TableValidation
-	for _, tbl := range tables {
-		tv := &agentv1.TableValidation{TableName: tbl}
-
-		if !srcOK {
-			tv.Error = "source does not support row counting"
-			results = append(results, tv)
-			continue
-		}
-		if !dstOK {
-			tv.Error = "destination does not support row counting"
-			results = append(results, tv)
-			continue
-		}
-
-		srcRows, err := srcCounter.RowCount(ctx, tbl)
-		if err != nil {
-			tv.Error = fmt.Sprintf("source count: %v", err)
-			results = append(results, tv)
-			continue
-		}
-		tv.SourceRows = srcRows
-
-		dstRows, err := dstCounter.RowCount(ctx, tbl)
-		if err != nil {
-			tv.Error = fmt.Sprintf("dest count: %v", err)
-			results = append(results, tv)
-			continue
-		}
-		tv.DestRows = dstRows
-		tv.Match = srcRows == dstRows
-
-		a.log.Info(ctx, "agent.validation.structural",
-			"job_id", jobID,
-			"table", tbl,
-			"source_rows", srcRows,
-			"dest_rows", dstRows,
-			"match", tv.Match,
-		)
-
-		results = append(results, tv)
+// toSharedSemanticRules converts proto SemanticRule → shared SemanticRule.
+func toSharedSemanticRules(rules []*agentv1.SemanticRule) []validation.SemanticRule {
+	out := make([]validation.SemanticRule, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, validation.SemanticRule{
+			Name:       r.GetName(),
+			RuleType:   r.GetRuleType(),
+			TableName:  r.GetTableName(),
+			Expression: r.GetExpression(),
+			Active:     true, // agent only receives active rules from Atlas
+		})
 	}
-	return results
+	return out
 }
 
-// ---------------------------------------------------------------------------
-// Layer 2: Content (checksums + row diffs)
-// ---------------------------------------------------------------------------
-
-func (a *Agent) validateContentFull(ctx context.Context, jobID string, src connector.Source, dst interface{}, tables []string) ([]*agentv1.ContentValidation, []*agentv1.RowDiff) {
-	srcHasher, srcOK := src.(connector.DataHasher)
-	dstHasher, dstOK := dst.(connector.DataHasher)
-
-	var content []*agentv1.ContentValidation
-	var allDiffs []*agentv1.RowDiff
-
-	for _, tbl := range tables {
-		cv := &agentv1.ContentValidation{TableName: tbl}
-
-		if !srcOK || !dstOK {
-			cv.Error = "connector does not support data hashing"
-			content = append(content, cv)
-			continue
-		}
-
-		srcChecksum, srcRows, err := srcHasher.HashTable(ctx, tbl)
-		if err != nil {
-			cv.Error = fmt.Sprintf("source hash: %v", err)
-			content = append(content, cv)
-			continue
-		}
-		cv.SourceChecksum = srcChecksum
-		cv.TotalRows = srcRows
-
-		dstChecksum, _, err := dstHasher.HashTable(ctx, tbl)
-		if err != nil {
-			cv.Error = fmt.Sprintf("dest hash: %v", err)
-			content = append(content, cv)
-			continue
-		}
-		cv.DestChecksum = dstChecksum
-		cv.Match = srcChecksum == dstChecksum
-
-		if !cv.Match {
-			tableDiffs := a.findRowDiffs(ctx, jobID, tbl, src, dst)
-			cv.DiffRowCount = int64(len(tableDiffs))
-			allDiffs = append(allDiffs, tableDiffs...)
-		}
-
-		a.log.Info(ctx, "agent.validation.content",
-			"job_id", jobID,
-			"table", tbl,
-			"match", cv.Match,
-			"diff_rows", cv.DiffRowCount,
-		)
-
-		content = append(content, cv)
+func toProtoStructural(results []validation.StructuralResult) []*agentv1.TableValidation {
+	out := make([]*agentv1.TableValidation, 0, len(results))
+	for _, r := range results {
+		out = append(out, &agentv1.TableValidation{
+			TableName:  r.Table,
+			SourceRows: r.SourceRows,
+			DestRows:   r.DestRows,
+			Match:      r.Match,
+			Error:      r.Error,
+		})
 	}
-	return content, allDiffs
+	return out
 }
 
-func (a *Agent) findRowDiffs(ctx context.Context, jobID, table string, src connector.Source, dst interface{}) []*agentv1.RowDiff {
-	srcDiffer, srcOK := src.(connector.RowDiffer)
-	dstDiffer, dstOK := dst.(connector.RowDiffer)
-	if !srcOK || !dstOK {
-		a.log.Warn(ctx, "agent.validation.row_diff_unsupported", "job_id", jobID, "table", table)
-		return nil
+func toProtoContent(results []validation.ContentResult) []*agentv1.ContentValidation {
+	out := make([]*agentv1.ContentValidation, 0, len(results))
+	for _, r := range results {
+		out = append(out, &agentv1.ContentValidation{
+			TableName:          r.Table,
+			SourceChecksum:     r.SourceChecksum,
+			DestChecksum:       r.DestChecksum,
+			TotalRows:          r.TotalRows,
+			Match:              r.Match,
+			DiffRowCount:       r.DiffCount,
+			MissingInDestCount: r.MissingInDest,
+			ExtraInDestCount:   r.ExtraInDest,
+			ModifiedCount:      r.Modified,
+			Error:              r.Error,
+		})
 	}
-
-	srcRows, err := srcDiffer.HashRows(ctx, table)
-	if err != nil {
-		a.log.Error(ctx, "agent.validation.src_hash_rows", "job_id", jobID, "table", table, "error", err)
-		return nil
-	}
-
-	dstRows, err := dstDiffer.HashRows(ctx, table)
-	if err != nil {
-		a.log.Error(ctx, "agent.validation.dst_hash_rows", "job_id", jobID, "table", table, "error", err)
-		return nil
-	}
-
-	var diffs []*agentv1.RowDiff
-
-	// Rows in source but not in dest, or modified.
-	for pk, srcHash := range srcRows {
-		dstHash, exists := dstRows[pk]
-		if !exists {
-			diffs = append(diffs, &agentv1.RowDiff{
-				TableName:  table,
-				PrimaryKey: pk,
-				DiffType:   "missing_in_dest",
-				SourceHash: srcHash,
-			})
-		} else if srcHash != dstHash {
-			diffs = append(diffs, &agentv1.RowDiff{
-				TableName:  table,
-				PrimaryKey: pk,
-				DiffType:   "modified",
-				SourceHash: srcHash,
-				DestHash:   dstHash,
-			})
-		}
-	}
-
-	// Rows in dest but not in source.
-	for pk, dstHash := range dstRows {
-		if _, exists := srcRows[pk]; !exists {
-			diffs = append(diffs, &agentv1.RowDiff{
-				TableName:  table,
-				PrimaryKey: pk,
-				DiffType:   "extra_in_dest",
-				DestHash:   dstHash,
-			})
-		}
-	}
-
-	return diffs
+	return out
 }
 
-// ---------------------------------------------------------------------------
-// Layer 3: Schema comparison
-// ---------------------------------------------------------------------------
-
-func (a *Agent) validateSchema(ctx context.Context, jobID string, src connector.Source, dst interface{}, tables []string) []*agentv1.SchemaComparison {
-	srcComparer, srcOK := src.(connector.SchemaComparer)
-	dstComparer, dstOK := dst.(connector.SchemaComparer)
-
-	var results []*agentv1.SchemaComparison
-	for _, tbl := range tables {
-		sc := &agentv1.SchemaComparison{TableName: tbl}
-
-		if !srcOK || !dstOK {
-			sc.Error = "connector does not support schema comparison"
-			results = append(results, sc)
-			continue
+func toProtoSchemas(results []validation.SchemaResult) []*agentv1.SchemaComparison {
+	out := make([]*agentv1.SchemaComparison, 0, len(results))
+	for _, r := range results {
+		sc := &agentv1.SchemaComparison{
+			TableName:    r.Table,
+			SourceSchema: r.SourceSchema,
+			DestSchema:   r.DestSchema,
+			Match:        r.Match,
+			Error:        r.Error,
 		}
-
-		srcJSON, err := srcComparer.GetTableSchema(ctx, tbl)
-		if err != nil {
-			sc.Error = fmt.Sprintf("source schema: %v", err)
-			results = append(results, sc)
-			continue
-		}
-		sc.SourceSchema = string(srcJSON)
-
-		dstJSON, err := dstComparer.GetTableSchema(ctx, tbl)
-		if err != nil {
-			sc.Error = fmt.Sprintf("dest schema: %v", err)
-			results = append(results, sc)
-			continue
-		}
-		sc.DestSchema = string(dstJSON)
-
-		sc.Differences = compareSchemas(srcJSON, dstJSON)
-		sc.Match = len(sc.Differences) == 0
-
-		a.log.Info(ctx, "agent.validation.schema",
-			"job_id", jobID,
-			"table", tbl,
-			"match", sc.Match,
-			"diffs", len(sc.Differences),
-		)
-
-		results = append(results, sc)
-	}
-	return results
-}
-
-// schemaColumn represents one column in the JSON schema returned by GetTableSchema.
-type schemaColumn struct {
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Nullable bool   `json:"nullable"`
-	Default  string `json:"default"`
-}
-
-// compareSchemas compares two JSON-encoded column arrays and returns diffs.
-func compareSchemas(srcJSON, dstJSON []byte) []*agentv1.SchemaDiff {
-	if bytes.Equal(srcJSON, dstJSON) {
-		return nil
-	}
-
-	var srcCols, dstCols []schemaColumn
-	if err := json.Unmarshal(srcJSON, &srcCols); err != nil {
-		return []*agentv1.SchemaDiff{{ColumnName: "_parse_error", DiffType: "parse_error", SourceValue: err.Error()}}
-	}
-	if err := json.Unmarshal(dstJSON, &dstCols); err != nil {
-		return []*agentv1.SchemaDiff{{ColumnName: "_parse_error", DiffType: "parse_error", DestValue: err.Error()}}
-	}
-
-	srcMap := make(map[string]schemaColumn, len(srcCols))
-	for _, c := range srcCols {
-		srcMap[c.Name] = c
-	}
-	dstMap := make(map[string]schemaColumn, len(dstCols))
-	for _, c := range dstCols {
-		dstMap[c.Name] = c
-	}
-
-	var diffs []*agentv1.SchemaDiff
-
-	for _, sc := range srcCols {
-		dc, exists := dstMap[sc.Name]
-		if !exists {
-			diffs = append(diffs, &agentv1.SchemaDiff{
-				ColumnName:  sc.Name,
-				DiffType:    "missing_in_dest",
-				SourceValue: sc.Type,
-			})
-			continue
-		}
-		if sc.Type != dc.Type {
-			diffs = append(diffs, &agentv1.SchemaDiff{
-				ColumnName:  sc.Name,
-				DiffType:    "type_changed",
-				SourceValue: sc.Type,
-				DestValue:   dc.Type,
+		for _, d := range r.Diffs {
+			sc.Differences = append(sc.Differences, &agentv1.SchemaDiff{
+				ColumnName:  d.ColumnName,
+				DiffType:    d.DiffType,
+				SourceValue: d.SourceValue,
+				DestValue:   d.DestValue,
 			})
 		}
-		if sc.Nullable != dc.Nullable {
-			diffs = append(diffs, &agentv1.SchemaDiff{
-				ColumnName:  sc.Name,
-				DiffType:    "nullable_changed",
-				SourceValue: fmt.Sprintf("%v", sc.Nullable),
-				DestValue:   fmt.Sprintf("%v", dc.Nullable),
-			})
-		}
+		out = append(out, sc)
 	}
-
-	for _, dc := range dstCols {
-		if _, exists := srcMap[dc.Name]; !exists {
-			diffs = append(diffs, &agentv1.SchemaDiff{
-				ColumnName: dc.Name,
-				DiffType:   "extra_in_dest",
-				DestValue:  dc.Type,
-			})
-		}
-	}
-
-	return diffs
+	return out
 }
 
-// ---------------------------------------------------------------------------
-// Layer 4: Semantic validation (user-defined assertions)
-// ---------------------------------------------------------------------------
-
-func (a *Agent) validateSemantic(ctx context.Context, jobID string, src connector.Source, dst interface{}, tables []string, rules []*agentv1.SemanticRule) []*agentv1.SemanticValidation {
-	if len(rules) == 0 {
-		return nil
+func toProtoSemantic(results []validation.SemanticResult) []*agentv1.SemanticValidation {
+	out := make([]*agentv1.SemanticValidation, 0, len(results))
+	for _, r := range results {
+		out = append(out, &agentv1.SemanticValidation{
+			RuleName:   r.RuleName,
+			RuleType:   r.RuleType,
+			TableName:  r.TableName,
+			Expression: r.Expression,
+			Expected:   r.Expected,
+			Actual:     r.Actual,
+			Passed:     r.Passed,
+			Error:      r.Error,
+		})
 	}
-
-	srcQuerier, srcOK := src.(connector.RawQuerier)
-	dstQuerier, dstOK := dst.(connector.RawQuerier)
-
-	var results []*agentv1.SemanticValidation
-	for _, rule := range rules {
-		sv := &agentv1.SemanticValidation{
-			RuleName:   rule.GetName(),
-			RuleType:   rule.GetRuleType(),
-			TableName:  rule.GetTableName(),
-			Expression: rule.GetExpression(),
-		}
-
-		if !srcOK || !dstOK {
-			sv.Error = "connector does not support raw queries"
-			results = append(results, sv)
-			continue
-		}
-
-		srcVal, err := srcQuerier.QueryScalar(ctx, rule.GetExpression())
-		if err != nil {
-			sv.Error = fmt.Sprintf("source query: %v", err)
-			results = append(results, sv)
-			continue
-		}
-		sv.Expected = fmt.Sprintf("%v", srcVal)
-
-		dstVal, err := dstQuerier.QueryScalar(ctx, rule.GetExpression())
-		if err != nil {
-			sv.Error = fmt.Sprintf("dest query: %v", err)
-			results = append(results, sv)
-			continue
-		}
-		sv.Actual = fmt.Sprintf("%v", dstVal)
-
-		sv.Passed = sv.Expected == sv.Actual
-
-		a.log.Info(ctx, "agent.validation.semantic",
-			"job_id", jobID,
-			"rule", rule.GetName(),
-			"passed", sv.Passed,
-		)
-
-		results = append(results, sv)
-	}
-	return results
-}
-
-// ---------------------------------------------------------------------------
-// Data profiling
-// ---------------------------------------------------------------------------
-
-func (a *Agent) profileData(ctx context.Context, jobID string, src connector.Source, dst interface{}, tables []string) []*agentv1.DataProfile {
-	srcProfiler, srcOK := src.(connector.DataProfiler)
-	dstProfiler, dstOK := dst.(connector.DataProfiler)
-
-	var results []*agentv1.DataProfile
-	for _, tbl := range tables {
-		dp := &agentv1.DataProfile{TableName: tbl}
-
-		if !srcOK || !dstOK {
-			dp.Error = "connector does not support data profiling"
-			results = append(results, dp)
-			continue
-		}
-
-		srcJSON, srcDups, err := srcProfiler.ProfileTable(ctx, tbl)
-		if err != nil {
-			dp.Error = fmt.Sprintf("source profile: %v", err)
-			results = append(results, dp)
-			continue
-		}
-		dp.SourceProfile = string(srcJSON)
-		dp.SourceDuplicates = srcDups
-
-		dstJSON, dstDups, err := dstProfiler.ProfileTable(ctx, tbl)
-		if err != nil {
-			dp.Error = fmt.Sprintf("dest profile: %v", err)
-			results = append(results, dp)
-			continue
-		}
-		dp.DestProfile = string(dstJSON)
-		dp.DestDuplicates = dstDups
-
-		results = append(results, dp)
-	}
-	return results
+	return out
 }
 
 // ---------------------------------------------------------------------------
 // Report builder + accuracy computation
 // ---------------------------------------------------------------------------
 
-// buildValidationReport assembles the final report and computes accuracy scores.
+// buildValidationReport converts shared results to proto and computes accuracy.
 func buildValidationReport(
 	jobID, runID string,
-	structural []*agentv1.TableValidation,
-	content []*agentv1.ContentValidation,
-	schemas []*agentv1.SchemaComparison,
-	semantic []*agentv1.SemanticValidation,
-	diffs []*agentv1.RowDiff,
-	profiles []*agentv1.DataProfile,
+	structural []validation.StructuralResult,
+	content []validation.ContentResult,
+	schemas []validation.SchemaResult,
+	semantic []validation.SemanticResult,
 ) *agentv1.ValidationReport {
 	r := &agentv1.ValidationReport{
 		JobId:      jobID,
 		RunId:      runID,
-		Structural: structural,
-		Content:    content,
-		Schemas:    schemas,
-		Semantic:   semantic,
-		RowDiffs:   diffs,
-		Profiles:   profiles,
+		Structural: toProtoStructural(structural),
+		Content:    toProtoContent(content),
+		Schemas:    toProtoSchemas(schemas),
+		Semantic:   toProtoSemantic(semantic),
 	}
 
-	// Structural accuracy: % of tables where row counts match.
-	if len(structural) > 0 {
-		matched := 0
-		valid := 0
-		for _, tv := range structural {
-			if tv.Error != "" {
-				continue
-			}
-			valid++
-			if tv.Match {
-				matched++
-			}
-		}
-		if valid > 0 {
-			r.StructuralAccuracy = float64(matched) / float64(valid) * 100
-		}
-	}
+	// Compute accuracies from shared results.
+	r.StructuralAccuracy = validation.StructuralAccuracy(structural)
 
-	// Content accuracy: % of tables with matching checksums.
-	if len(content) > 0 {
-		var totalTables, matchTables, diffTables int32
-		var totalRows, totalDiff int64
-		for _, cv := range content {
-			if cv.Error != "" {
-				continue
-			}
-			totalTables++
-			totalRows += cv.TotalRows
-			if cv.Match {
-				matchTables++
-			} else {
-				diffTables++
-				totalDiff += cv.DiffRowCount
-			}
-		}
-		r.ContentTablesTotal = totalTables
-		r.ContentTablesMatch = matchTables
-		r.ContentTablesDiff = diffTables
-		r.TotalRowsHashed = totalRows
-		r.TotalDiffRows = totalDiff
-		if totalTables > 0 {
-			r.ContentAccuracy = float64(matchTables) / float64(totalTables) * 100
-		}
-	}
+	cs := validation.ContentAccuracy(content)
+	r.ContentAccuracy = cs.Accuracy
+	r.ContentTablesTotal = int32(cs.TablesTotal)
+	r.ContentTablesMatch = int32(cs.TablesMatch)
+	r.ContentTablesDiff = int32(cs.TablesDiff)
+	r.TotalRowsHashed = cs.TotalRows
+	r.TotalDiffRows = cs.TotalDiff
 
-	// Schema fidelity: % of tables with matching schemas.
-	if len(schemas) > 0 {
-		matched := 0
-		valid := 0
-		for _, sc := range schemas {
-			if sc.Error != "" {
-				continue
-			}
-			valid++
-			if sc.Match {
-				matched++
-			}
-		}
-		if valid > 0 {
-			r.SchemaFidelity = float64(matched) / float64(valid) * 100
-		}
-	}
+	r.SchemaFidelity = validation.SchemaAccuracy(schemas)
+	r.SemanticAccuracy = validation.SemanticAccuracy(semantic)
+	r.OverallAccuracy = validation.ComputeOverallAccuracy(
+		r.StructuralAccuracy, r.ContentAccuracy,
+		r.SchemaFidelity, r.SemanticAccuracy,
+		len(structural) > 0, len(content) > 0,
+		len(schemas) > 0, len(semantic) > 0,
+	)
 
-	// Semantic accuracy: % of rules that passed.
-	if len(semantic) > 0 {
-		passed := 0
-		valid := 0
-		for _, sv := range semantic {
-			if sv.Error != "" {
-				continue
-			}
-			valid++
-			if sv.Passed {
-				passed++
-			}
-		}
-		if valid > 0 {
-			r.SemanticAccuracy = float64(passed) / float64(valid) * 100
-		}
-	}
-
-	r.OverallAccuracy = computeOverallAccuracy(r)
 	return r
-}
-
-// Accuracy weights for the overall score.
-const (
-	weightStructural = 0.30
-	weightContent    = 0.35
-	weightSchema     = 0.15
-	weightSemantic   = 0.20
-)
-
-// computeOverallAccuracy calculates a weighted average of layer accuracies.
-// Layers that were not executed (empty slices) are excluded from the denominator.
-func computeOverallAccuracy(r *agentv1.ValidationReport) float64 {
-	var totalWeight, weightedSum float64
-
-	if len(r.Structural) > 0 {
-		totalWeight += weightStructural
-		weightedSum += weightStructural * r.StructuralAccuracy
-	}
-	if len(r.Content) > 0 {
-		totalWeight += weightContent
-		weightedSum += weightContent * r.ContentAccuracy
-	}
-	if len(r.Schemas) > 0 {
-		totalWeight += weightSchema
-		weightedSum += weightSchema * r.SchemaFidelity
-	}
-	if len(r.Semantic) > 0 {
-		totalWeight += weightSemantic
-		weightedSum += weightSemantic * r.SemanticAccuracy
-	}
-
-	if totalWeight == 0 {
-		return 0
-	}
-	return weightedSum / totalWeight
 }
 
 // ---------------------------------------------------------------------------
@@ -693,14 +377,4 @@ func (a *Agent) sendValidationError(jobID, runID string, err error) {
 			},
 		},
 	})
-}
-
-func countDiffType(diffs []*agentv1.RowDiff, diffType string) int {
-	n := 0
-	for _, d := range diffs {
-		if d.DiffType == diffType {
-			n++
-		}
-	}
-	return n
 }
