@@ -12,10 +12,9 @@ import (
 	"time"
 
 	"github.com/zwiron/connector"
-	"github.com/zwiron/engine/checkpoint"
-	"github.com/zwiron/engine/engine"
+	"github.com/zwiron/engine/runner"
 	"github.com/zwiron/engine/transform"
-	"github.com/zwiron/pkg/logger"
+	"github.com/zwiron/engine/config"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -25,7 +24,190 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-// handleStartJob decrypts connection configs and runs the engine.
+// =========================================================================
+// gRPC Reporter — bridges runner.Reporter to the agent's gRPC stream.
+
+type gRPCReporter struct {
+	agent *Agent
+	mu    sync.Mutex
+	runs  map[string]string // jobID → runID
+}
+
+func newGRPCReporter(a *Agent) *gRPCReporter {
+	return &gRPCReporter{agent: a, runs: make(map[string]string)}
+}
+
+func (r *gRPCReporter) register(jobID, runID string) {
+	r.mu.Lock()
+	r.runs[jobID] = runID
+	r.mu.Unlock()
+}
+
+func (r *gRPCReporter) unregister(jobID string) {
+	r.mu.Lock()
+	delete(r.runs, jobID)
+	r.mu.Unlock()
+}
+
+func (r *gRPCReporter) runID(jobID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.runs[jobID]
+}
+
+func (r *gRPCReporter) runningJobs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	jobs := make([]string, 0, len(r.runs))
+	for id := range r.runs {
+		jobs = append(jobs, id)
+	}
+	return jobs
+}
+
+func (r *gRPCReporter) ReportProgress(jobID string, p runner.Progress) {
+	runID := r.runID(jobID)
+	r.agent.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobProgress{
+			JobProgress: &agentv1.JobProgress{
+				JobId:          jobID,
+				TotalRows:      p.TotalRows,
+				RowsCompleted:  p.TotalRows,
+				RowsPerSec:     p.RowsPerSec,
+				Pct:            p.Pct,
+				TasksTotal:     int32(p.TasksTotal),
+				TasksCompleted: int32(p.TasksCompleted),
+				TasksRunning:   int32(p.TasksRunning),
+				TasksPending:   int32(p.TasksPending),
+				TasksFailed:    int32(p.TasksFailed),
+				Timestamp:      timestamppb.Now(),
+				ReadWorkers:    int32(p.ReadWorkers),
+				WriteWorkers:   int32(p.WriteWorkers),
+				AvgRps:         p.AvgRps,
+				WriteStrategy:  p.WriteStrategy,
+				RunId:          runID,
+			},
+		},
+	})
+}
+
+func (r *gRPCReporter) ReportEvent(jobID string, ev config.Event) {
+	r.agent.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobEvent{
+			JobEvent: &agentv1.JobEvent{
+				JobId:     jobID,
+				EventType: string(ev.Type),
+				Table:     ev.Table,
+				Rows:      ev.Rows,
+				Error:     ev.Error,
+				Timestamp: timestamppb.Now(),
+			},
+		},
+	})
+}
+
+func (r *gRPCReporter) ReportProposal(jobID string, p runner.SchemaProposal) {
+	runID := r.runID(jobID)
+	r.agent.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_SchemaProposal{
+			SchemaProposal: &agentv1.SchemaChangeProposal{
+				ProposalId:    p.ID,
+				JobId:         jobID,
+				RunId:         runID,
+				TableName:     p.TableName,
+				Status:        p.Status,
+				ChangesJson:   p.ChangesJSON,
+				OldSchemaJson: p.OldSchemaJSON,
+				NewSchemaJson: p.NewSchemaJSON,
+				AutoApplied:   p.AutoApplied,
+				CreatedAt:     timestamppb.New(p.CreatedAt),
+			},
+		},
+	})
+}
+
+func (r *gRPCReporter) ReportCompleted(jobID string, result runner.Result) {
+	runID := r.runID(jobID)
+	r.agent.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobCompleted{
+			JobCompleted: &agentv1.JobCompleted{
+				JobId:       jobID,
+				TotalRows:   result.TotalRows,
+				RowsPerSec:  result.RowsPerSec,
+				DurationMs:  result.DurationMs,
+				CompletedAt: timestamppb.Now(),
+				RunId:       runID,
+			},
+		},
+	})
+}
+
+func (r *gRPCReporter) ReportFailed(jobID string, err error, result runner.Result) {
+	runID := r.runID(jobID)
+	r.agent.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobFailed{
+			JobFailed: &agentv1.JobFailed{
+				JobId:         jobID,
+				ErrorMessage:  err.Error(),
+				RowsCompleted: result.TotalRows,
+				DurationMs:    result.DurationMs,
+				FailedAt:      timestamppb.Now(),
+				RunId:         runID,
+			},
+		},
+	})
+}
+
+// =========================================================================
+// File-based CDC Store — wraps agent's JSON-file persistence.
+
+type fileCDCStore struct {
+	agent *Agent
+}
+
+func (s *fileCDCStore) LoadPosition(key string) ([]byte, error) {
+	return s.agent.loadCDCPosition(key)
+}
+
+func (s *fileCDCStore) SavePosition(key string, position []byte) error {
+	return s.agent.saveCDCPosition(key, position)
+}
+
+// =========================================================================
+// Runner initialization
+
+// initRunner creates the runner.Runner for the agent. Called once during startup.
+func (a *Agent) initRunner() {
+	a.reporter = newGRPCReporter(a)
+	a.jobRunner = runner.New(runner.Config{
+		Log:              a.log,
+		Reporter:         a.reporter,
+		CDCStore:         &fileCDCStore{agent: a},
+		CheckpointDir:    a.dataDir,
+		ProgressInterval: 3 * time.Second,
+	})
+}
+
+// sendJobFailed sends a JobFailed event for pre-run errors (decrypt failure, etc.).
+func (a *Agent) sendJobFailed(jobID, runID, errMsg string, rowsCompleted, durationMs int64) {
+	a.sendEvent(&agentv1.ConnectRequest{
+		Payload: &agentv1.ConnectRequest_JobFailed{
+			JobFailed: &agentv1.JobFailed{
+				JobId:         jobID,
+				ErrorMessage:  errMsg,
+				RowsCompleted: rowsCompleted,
+				DurationMs:    durationMs,
+				FailedAt:      timestamppb.Now(),
+				RunId:         runID,
+			},
+		},
+	})
+}
+
+// =========================================================================
+// Job handling
+
+// handleStartJob decrypts connection configs and runs the engine via runner.Runner.
 func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	jobID := cmd.GetJobId()
 	runID := cmd.GetRunId()
@@ -78,24 +260,6 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 		"workers", cmd.GetWorkers(),
 	)
 
-	// Create a cancellable context for this job.
-	jobCtx, jobCancel := context.WithCancel(ctx)
-	a.mu.Lock()
-	if _, alreadyRunning := a.cancels[jobID]; alreadyRunning {
-		a.mu.Unlock()
-		jobCancel()
-		a.log.Warn(ctx, "agent.job.already_running", "job_id", jobID)
-		return
-	}
-	a.cancels[jobID] = jobCancel
-	a.mu.Unlock()
-	defer func() {
-		jobCancel()
-		a.mu.Lock()
-		delete(a.cancels, jobID)
-		a.mu.Unlock()
-	}()
-
 	// Decrypt source and destination configs.
 	_, decryptSpan := tracer.Start(ctx, "agent.decrypt_config")
 	srcConfig, err := DecryptConfig(a.keys.Private, cmd.GetSource().GetEncryptedConfig())
@@ -121,165 +285,57 @@ func (a *Agent) handleStartJob(ctx context.Context, cmd *agentv1.StartJob) {
 	}
 	decryptSpan.End()
 
-	// Open checkpoint store for this job.
-	cpPath := filepath.Join(a.dataDir, fmt.Sprintf("checkpoint-%s.db", jobID))
+	// Register runID so the reporter can include it in gRPC messages.
+	a.reporter.register(jobID, runID)
+	defer a.reporter.unregister(jobID)
 
-	// Fresh start: delete any existing checkpoint so the job starts from scratch.
-	if cmd.GetFreshStart() {
-		_ = os.Remove(cpPath)
-		_ = os.Remove(cpPath + "-wal")
-		_ = os.Remove(cpPath + "-shm")
-		a.log.Info(ctx, "agent.job.fresh_start", "job_id", jobID)
-	}
-
-	store, err := checkpoint.NewSQLiteStore(checkpoint.SQLiteConfig{
-		Path:   cpPath,
-		Logger: a.log,
-	})
-	if err != nil {
-		a.sendJobFailed(jobID, runID, fmt.Sprintf("open checkpoint: %v", err), 0, 0)
-		return
-	}
-	defer store.Close()
-
-	// Build engine config.
-	workers := int(cmd.GetWorkers())
-	maxRetries := int(cmd.GetMaxRetries())
-	if maxRetries <= 0 {
-		maxRetries = 3
-	}
-
-	engineCfg := engine.Config{
+	// Build job spec for the unified runner.
+	spec := runner.JobSpec{
+		JobID:        jobID,
+		RunID:        runID,
 		SourceType:   cmd.GetSource().GetConnectorType(),
 		SourceConfig: connector.Config(srcConfig),
 		DestType:     cmd.GetDest().GetConnectorType(),
 		DestConfig:   connector.Config(dstConfig),
 		Tables:       cmd.GetTables(),
-		Workers:      workers,
-		MaxRetries:   maxRetries,
+		Workers:      int(cmd.GetWorkers()),
+		MaxRetries:   int(cmd.GetMaxRetries()),
 		SyncMode:     cmd.GetSyncMode(),
 		DestSyncMode: cmd.GetDestSyncMode(),
 		Transforms:   protoToTransformSpec(cmd.GetTransforms()),
-		OnEvent: func(ev engine.Event) {
-			a.sendJobEvent(jobID, ev)
-
-			// Forward full schema proposals to Atlas via gRPC.
-			if ev.ProposalID != "" {
-				a.forwardSchemaProposal(jobID, runID, ev, store)
-			}
-		},
+		FreshStart:   cmd.GetFreshStart(),
+		CDCKey:       cdcPositionKey(cmd),
 	}
 
-	// For CDC mode, load previous position for cross-run resumption.
-	cdcKey := cdcPositionKey(cmd)
-	if cmd.GetSyncMode() == "cdc" {
-		if pos, err := a.loadCDCPosition(cdcKey); err == nil && len(pos) > 0 {
-			engineCfg.InitialCDCPosition = pos
-			a.log.Info(ctx, "agent.cdc.resume",
-				"job_id", jobID,
-				"position_bytes", len(pos),
-			)
-		}
-	}
+	// Run the engine via the unified runner. The runner handles:
+	// checkpoint, CDC position, progress reporting, schema proposals,
+	// and completion/failure reporting via the gRPCReporter.
+	result, runErr := a.jobRunner.Run(ctx, spec)
 
-	// Run the engine.
-	eng := engine.New(store, a.log)
-
-	// Start progress reporter in background. It reads engine result
-	// for metadata (read/write workers, write strategy).
-	progressCtx, progressCancel := context.WithCancel(jobCtx)
-	var progressWg sync.WaitGroup
-	progressWg.Add(1)
-	go func() {
-		defer progressWg.Done()
-		a.reportJobProgress(progressCtx, jobID, runID, store, eng)
-	}()
-
-	startTime := time.Now()
-	runErr := eng.Run(jobCtx, engineCfg)
-	progressCancel()
-	progressWg.Wait()
-	durationMs := time.Since(startTime).Milliseconds()
-
-	// Record job duration metric.
+	// Record metrics.
 	if a.metrics != nil {
-		a.metrics.JobDuration.Observe(float64(durationMs) / 1000.0)
+		a.metrics.JobDuration.Observe(float64(result.DurationMs) / 1000.0)
 	}
 
-	// Send final progress snapshot so Atlas has accurate task/worker counts.
-	a.sendProgressSnapshot(jobID, runID, store, eng)
-
-	// Send final status.
 	if runErr != nil {
-		a.log.Error(ctx, "agent.job.failed", "job_id", jobID, "error", runErr)
 		span.RecordError(runErr)
 		span.SetStatus(otelcodes.Error, runErr.Error())
 		if a.metrics != nil {
 			a.metrics.JobsFailed.Inc()
 		}
-		a.sendJobFailed(jobID, runID, runErr.Error(), 0, durationMs)
 		return
 	}
 
-	// Get final stats from checkpoint.
-	jobs, _ := store.ListJobs(context.Background())
-	var totalRows int64
-	var rowsPerSec float64
-	for _, j := range jobs {
-		totalRows += j.TotalRows
-	}
-	if secs := float64(durationMs) / 1000; secs > 0 {
-		rowsPerSec = float64(totalRows) / secs
-	}
-
-	a.log.Info(ctx, "agent.job.completed",
-		"job_id", jobID,
-		"total_rows", totalRows,
-		"duration_ms", durationMs,
-		"rows_per_sec", rowsPerSec,
-	)
-
+	// Successful completion — record metrics and tracing.
 	if a.metrics != nil {
-		a.metrics.RowsTotal.Add(float64(totalRows))
+		a.metrics.RowsTotal.Add(float64(result.TotalRows))
 	}
-
 	span.SetAttributes(
-		attribute.Int64("total_rows", totalRows),
-		attribute.Int64("duration_ms", durationMs),
+		attribute.Int64("total_rows", result.TotalRows),
+		attribute.Int64("duration_ms", result.DurationMs),
 	)
 
-	a.sendEvent(&agentv1.ConnectRequest{
-		Payload: &agentv1.ConnectRequest_JobCompleted{
-			JobCompleted: &agentv1.JobCompleted{
-				JobId:       jobID,
-				TotalRows:   totalRows,
-				RowsPerSec:  rowsPerSec,
-				DurationMs:  durationMs,
-				CompletedAt: timestamppb.Now(),
-				RunId:       runID,
-			},
-		},
-	})
-
-	// Persist CDC position for future runs.
-	if cmd.GetSyncMode() == "cdc" {
-		result := eng.Result()
-		if len(result.FinalCDCPosition) > 0 {
-			if err := a.saveCDCPosition(cdcKey, result.FinalCDCPosition); err != nil {
-				a.log.Error(ctx, "agent.cdc.save_position.error", "error", err)
-			} else {
-				a.log.Info(ctx, "agent.cdc.position_saved",
-					"job_id", jobID,
-					"bytes", len(result.FinalCDCPosition),
-				)
-			}
-		}
-	}
-
-	// Run post-sync row count validation in the background so it doesn't
-	// delay the completed event. Validation results are sent separately.
-	// Use a detached context with timeout — the job context is about to be
-	// cancelled by the deferred cleanup above, so validation needs its own.
+	// Post-sync row count validation (background, best-effort).
 	valCtx, valCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	go func() {
 		defer valCancel()
@@ -393,237 +449,11 @@ func (a *Agent) handleCancelJob(ctx context.Context, cmd *agentv1.CancelJob) {
 	jobID := cmd.GetJobId()
 	a.log.Info(ctx, "agent.job.cancel", "job_id", jobID, "reason", cmd.GetReason())
 
-	a.mu.Lock()
-	cancel, ok := a.cancels[jobID]
-	a.mu.Unlock()
-
-	if ok {
-		cancel()
+	if a.jobRunner.CancelJob(jobID) {
 		a.log.Info(ctx, "agent.job.cancelled", "job_id", jobID)
 	} else {
 		a.log.Warn(ctx, "agent.job.cancel.not_found", "job_id", jobID)
 	}
-}
-
-// reportJobProgress sends an immediate snapshot, then periodically reads checkpoint state.
-func (a *Agent) reportJobProgress(ctx context.Context, jobID, runID string, store checkpoint.Store, eng *engine.Engine) {
-	// Send first snapshot immediately so Atlas marks the job as running.
-	a.sendProgressSnapshot(jobID, runID, store, eng)
-
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			a.sendProgressSnapshot(jobID, runID, store, eng)
-		}
-	}
-}
-
-func (a *Agent) sendProgressSnapshot(jobID, runID string, store checkpoint.Store, eng *engine.Engine) {
-	result := eng.Result()
-	workerCount := result.WriteWorkers
-	if workerCount <= 0 {
-		workerCount = 4 // fallback before engine has tuned
-	}
-	// The engine creates one checkpoint job per table with its own ID,
-	// not the Atlas job ID. Aggregate across all checkpoint jobs.
-	cpJobs, err := store.ListJobs(context.Background())
-	if err != nil || len(cpJobs) == 0 {
-		return
-	}
-
-	var totalRows, rowsCompleted int64
-	var totalTasks, completedTasks, runningTasks, pendingTasks, failedTasks int64
-	var rowsPerSec float64
-	var startTime time.Time
-	var allWorkerStatuses []*agentv1.WorkerStatus
-
-	for _, cpJob := range cpJobs {
-		p, err := store.JobProgress(context.Background(), cpJob.ID)
-		if err != nil {
-			continue
-		}
-		totalTasks += p.Total
-		completedTasks += p.Completed
-		runningTasks += p.Running
-		pendingTasks += p.Pending
-		failedTasks += p.Failed
-		totalRows += cpJob.TotalRows
-		rowsCompleted += cpJob.TotalRows
-		rowsPerSec += p.RowsPerSec
-		if startTime.IsZero() || (!cpJob.CreatedAt.IsZero() && cpJob.CreatedAt.Before(startTime)) {
-			startTime = cpJob.CreatedAt
-		}
-
-		snapshots, err := store.WorkerSnapshots(context.Background(), cpJob.ID, workerCount)
-		if err == nil {
-			for _, ws := range snapshots {
-				allWorkerStatuses = append(allWorkerStatuses, &agentv1.WorkerStatus{
-					WorkerId:  ws.WorkerID,
-					Status:    ws.Status,
-					TaskId:    ws.TaskID,
-					TableName: ws.TableName,
-					RangeStr:  ws.RangeStr,
-					RowsDone:  ws.RowsDone,
-					TasksDone: ws.TasksDone,
-					TotalRows: ws.TotalRows,
-				})
-			}
-		}
-	}
-
-	pct := float64(0)
-	if totalTasks > 0 {
-		pct = float64(completedTasks) / float64(totalTasks) * 100
-	}
-
-	// Deduplicate workers — merge snapshots by worker ID (pick the active one).
-	merged := make(map[string]*agentv1.WorkerStatus, workerCount)
-	for _, ws := range allWorkerStatuses {
-		existing, ok := merged[ws.WorkerId]
-		if !ok || ws.Status == "running" {
-			if ok {
-				// Accumulate totals from previous entry.
-				ws.TasksDone += existing.TasksDone
-				ws.TotalRows += existing.TotalRows
-			}
-			merged[ws.WorkerId] = ws
-		} else {
-			existing.TasksDone += ws.TasksDone
-			existing.TotalRows += ws.TotalRows
-		}
-	}
-	workerStatuses := make([]*agentv1.WorkerStatus, 0, len(merged))
-	for i := 0; i < workerCount; i++ {
-		wid := fmt.Sprintf("worker-%d", i)
-		if ws, ok := merged[wid]; ok {
-			workerStatuses = append(workerStatuses, ws)
-		}
-	}
-
-	// Compute average rps since job start.
-	var avgRps float64
-	if !startTime.IsZero() {
-		elapsed := time.Since(startTime).Seconds()
-		if elapsed > 0 {
-			avgRps = float64(rowsCompleted) / elapsed
-		}
-	}
-
-	a.sendEvent(&agentv1.ConnectRequest{
-		Payload: &agentv1.ConnectRequest_JobProgress{
-			JobProgress: &agentv1.JobProgress{
-				JobId:          jobID,
-				TotalRows:      totalRows,
-				RowsCompleted:  rowsCompleted,
-				RowsPerSec:     rowsPerSec,
-				Pct:            pct,
-				TasksTotal:     int32(totalTasks),
-				TasksCompleted: int32(completedTasks),
-				TasksRunning:   int32(runningTasks),
-				TasksPending:   int32(pendingTasks),
-				TasksFailed:    int32(failedTasks),
-				Timestamp:      timestamppb.Now(),
-				Workers:        workerStatuses,
-				ReadWorkers:    int32(result.ReadWorkers),
-				WriteWorkers:   int32(result.WriteWorkers),
-				AvgRps:         avgRps,
-				WriteStrategy:  result.WriteStrategy,
-				RunId:          runID,
-			},
-		},
-	})
-}
-
-func (a *Agent) sendJobFailed(jobID, runID, errMsg string, rowsCompleted, durationMs int64) {
-	a.sendEvent(&agentv1.ConnectRequest{
-		Payload: &agentv1.ConnectRequest_JobFailed{
-			JobFailed: &agentv1.JobFailed{
-				JobId:         jobID,
-				ErrorMessage:  errMsg,
-				RowsCompleted: rowsCompleted,
-				DurationMs:    durationMs,
-				FailedAt:      timestamppb.Now(),
-				RunId:         runID,
-			},
-		},
-	})
-}
-
-func (a *Agent) sendJobEvent(jobID string, ev engine.Event) {
-	a.sendEvent(&agentv1.ConnectRequest{
-		Payload: &agentv1.ConnectRequest_JobEvent{
-			JobEvent: &agentv1.JobEvent{
-				JobId:     jobID,
-				EventType: string(ev.Type),
-				Worker:    ev.Worker,
-				TaskId:    ev.TaskID,
-				Table:     ev.Table,
-				Range:     ev.Range,
-				Rows:      ev.Rows,
-				ReadMs:    ev.ReadMs,
-				WriteMs:   ev.WriteMs,
-				Error:     ev.Error,
-				Attempt:   int32(ev.Attempt),
-				Timestamp: timestamppb.Now(),
-			},
-		},
-	})
-}
-
-// forwardSchemaProposal reads a proposal from the local checkpoint store
-// and sends the full payload to Atlas via a ConnectRequest_SchemaProposal
-// message. This bridges the gap between engine-local proposals and the
-// Atlas schema_proposals table shown in the UI.
-func (a *Agent) forwardSchemaProposal(jobID, runID string, ev engine.Event, store *checkpoint.SQLiteStore) {
-	ctx := context.Background()
-	proposal, err := store.GetProposal(ctx, ev.ProposalID)
-	if err != nil {
-		a.log.Error(ctx, "agent.schema_proposal.read_error",
-			"job_id", jobID, "proposal_id", ev.ProposalID, "error", err)
-		return
-	}
-	if proposal == nil {
-		a.log.Warn(ctx, "agent.schema_proposal.not_found",
-			"job_id", jobID, "proposal_id", ev.ProposalID)
-		return
-	}
-
-	autoApplied := ev.Type == engine.EventSchemaAutoApplied
-	status := "pending"
-	if autoApplied {
-		status = "auto_applied"
-	}
-
-	a.sendEvent(&agentv1.ConnectRequest{
-		Payload: &agentv1.ConnectRequest_SchemaProposal{
-			SchemaProposal: &agentv1.SchemaChangeProposal{
-				ProposalId:    proposal.ID,
-				JobId:         jobID,
-				RunId:         runID,
-				TableName:     proposal.TableName,
-				Status:        status,
-				ChangesJson:   proposal.ChangesJSON,
-				OldSchemaJson: proposal.OldSchemaJSON,
-				NewSchemaJson: proposal.NewSchemaJSON,
-				AutoApplied:   autoApplied,
-				CreatedAt:     timestamppb.New(proposal.CreatedAt),
-			},
-		},
-	})
-
-	a.log.Info(ctx, "agent.schema_proposal.forwarded",
-		"job_id", jobID, "proposal_id", proposal.ID,
-		"table", proposal.TableName, "status", status)
-}
-
-func newJobLogger(base *logger.Logger, jobID string) *logger.Logger {
-	_ = jobID
-	return base
 }
 
 // protoToTransformSpec converts proto TransformRule messages into an engine transform.Spec.

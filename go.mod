@@ -4,8 +4,8 @@ go 1.26.1
 
 require (
 	github.com/prometheus/client_golang v1.23.2
-	github.com/zwiron/connector v1.1.12
-	github.com/zwiron/engine v0.14.10
+	github.com/zwiron/connector v1.1.13
+	github.com/zwiron/engine v0.14.20
 	github.com/zwiron/pkg/logger v0.1.0
 	github.com/zwiron/pkg/tracing v0.1.0
 	github.com/zwiron/proto/gen/go v0.12.1
@@ -48,6 +48,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/minio/asm2plan9s v0.0.0-20200509001527-cdd76441f9d8 // indirect
 	github.com/minio/c2goasm v0.0.0-20190812172519-36a3d3bbc4f3 // indirect
+	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
@@ -61,7 +62,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect
-	github.com/zwiron/pkg v0.0.0-20260319101143-6bce76d280df // indirect
+	github.com/zwiron/pkg v0.3.0 // indirect
 	github.com/zwiron/pkg/errors v0.1.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.42.0 // indirect

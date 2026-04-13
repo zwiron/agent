@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zwiron/engine/runner"
 	"github.com/zwiron/pkg/logger"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -35,12 +36,14 @@ type Agent struct {
 	stream  agentv1.AgentService_ConnectClient
 	sendMu  sync.Mutex // Serializes all stream.Send() calls (gRPC streams are not goroutine-safe).
 
-	// Active jobs — keyed by job ID.
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc
+	// Unified job runner — handles engine execution, checkpointing,
+	// progress reporting, CDC persistence, and schema proposals.
+	jobRunner *runner.Runner
+	reporter  *gRPCReporter
 
 	// Paused state — when true, agent rejects new jobs.
 	paused bool
+	mu     sync.Mutex
 
 	// Concurrency limit — max simultaneous jobs (0 = unlimited).
 	maxJobs int
@@ -56,7 +59,7 @@ type Agent struct {
 // Run connects to Atlas, registers, and enters the main command loop.
 // It blocks until the context is cancelled or the connection drops.
 func (a *Agent) Run(ctx context.Context) error {
-	a.cancels = make(map[string]context.CancelFunc)
+	a.initRunner()
 
 	// Dial Atlas gRPC.
 	opts := []grpc.DialOption{
@@ -290,12 +293,13 @@ func (a *Agent) handlePause(ctx context.Context, cmd *agentv1.PauseAgent) {
 
 	a.mu.Lock()
 	a.paused = true
-	// Cancel all running jobs.
-	for jobID, cancel := range a.cancels {
-		a.log.Info(ctx, "agent.pause.cancel_job", "job_id", jobID)
-		cancel()
-	}
 	a.mu.Unlock()
+
+	// Cancel all running jobs through the runner.
+	for _, jobID := range a.reporter.runningJobs() {
+		a.log.Info(ctx, "agent.pause.cancel_job", "job_id", jobID)
+		a.jobRunner.CancelJob(jobID)
+	}
 }
 
 // handleResume unpauses the agent so it can accept new jobs.
