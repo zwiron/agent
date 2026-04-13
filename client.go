@@ -269,6 +269,8 @@ func (a *Agent) recvLoop(ctx context.Context) error {
 			cmd := payload.TriggerValidation
 			a.log.Info(ctx, "agent.trigger_validation", "job_id", cmd.GetJobId())
 			go a.runOnDemandValidation(ctx, cmd.GetJobId(), cmd.GetRunId(), cmd)
+		case *agentv1.ConnectResponse_ProfileConnection:
+			go a.handleProfileConnection(ctx, payload.ProfileConnection)
 		default:
 			a.log.Warn(ctx, "agent.unknown_command", "type", fmt.Sprintf("%T", msg.GetPayload()))
 		}
