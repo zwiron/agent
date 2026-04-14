@@ -456,3 +456,78 @@ func TestCdcPositionKey_NilConnections(t *testing.T) {
 // --------------- Pause / Resume ---------------
 
 // HandlePause tests removed — cancels field replaced by jobRunner.
+
+// ── gRPCReporter tests ─────────────────────────────────────────────────────
+
+func TestGRPCReporter_RegisterUnregister(t *testing.T) {
+	t.Parallel()
+	r := &gRPCReporter{runs: make(map[string]string)}
+	r.register("job-1", "run-a")
+	r.register("job-2", "run-b")
+
+	if got := r.runID("job-1"); got != "run-a" {
+		t.Fatalf("runID(job-1) = %q, want run-a", got)
+	}
+	if got := r.runID("job-2"); got != "run-b" {
+		t.Fatalf("runID(job-2) = %q, want run-b", got)
+	}
+
+	jobs := r.runningJobs()
+	if len(jobs) != 2 {
+		t.Fatalf("runningJobs() len = %d, want 2", len(jobs))
+	}
+
+	r.unregister("job-1")
+	if got := r.runID("job-1"); got != "" {
+		t.Fatalf("after unregister, runID(job-1) = %q, want empty", got)
+	}
+
+	jobs = r.runningJobs()
+	if len(jobs) != 1 {
+		t.Fatalf("runningJobs() len = %d, want 1", len(jobs))
+	}
+}
+
+func TestGRPCReporter_ConcurrentAccess(t *testing.T) {
+	t.Parallel()
+	r := &gRPCReporter{runs: make(map[string]string)}
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			id := string(rune('A' + n%26))
+			r.register(id, id)
+			_ = r.runID(id)
+			_ = r.runningJobs()
+			r.unregister(id)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestCDCPositionKey_Format(t *testing.T) {
+	t.Parallel()
+	cmd := &agentv1.StartJob{
+		Source: &agentv1.EncryptedConnection{ConnectionId: "src-456"},
+		Dest:   &agentv1.EncryptedConnection{ConnectionId: "dst-789"},
+	}
+	key := cdcPositionKey(cmd)
+	if key == "" {
+		t.Fatal("expected non-empty key")
+	}
+	// Same inputs should produce the same key (deterministic).
+	key2 := cdcPositionKey(cmd)
+	if key != key2 {
+		t.Fatalf("keys differ: %q vs %q", key, key2)
+	}
+	// Different inputs should produce different keys.
+	cmd2 := &agentv1.StartJob{
+		Source: &agentv1.EncryptedConnection{ConnectionId: "src-456"},
+		Dest:   &agentv1.EncryptedConnection{ConnectionId: "dst-000"},
+	}
+	key3 := cdcPositionKey(cmd2)
+	if key == key3 {
+		t.Fatal("different inputs produced same key")
+	}
+}
