@@ -18,7 +18,6 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -27,7 +26,6 @@ type Agent struct {
 	log       *logger.Logger
 	token     string
 	atlasAddr string
-	insecure  bool
 	dataDir   string
 	keys      *KeyPair
 
@@ -66,28 +64,32 @@ func (a *Agent) Run(ctx context.Context) error {
 		grpc.WithDefaultCallOptions(),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
-	if a.insecure {
-		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	// Load pinned Atlas CA cert if available (received in previous RegistrationAck).
+	caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
+	hasPinnedCA := false
+	if caPEM, err := os.ReadFile(caPath); err == nil {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM(caPEM) {
+			tlsCfg.RootCAs = pool
+			hasPinnedCA = true
+			a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
+		}
 	} else {
-		tlsCfg := &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		}
+		// First connection — no pinned CA yet. Trust the server's cert and
+		// pin the CA from RegistrationAck for all future connections.
+		tlsCfg.InsecureSkipVerify = true
+		a.log.Info(ctx, "agent.tls.first_connect", "msg", "no pinned CA, will trust-on-first-use")
+	}
 
-		// Load pinned Atlas CA cert if available (received in previous RegistrationAck).
-		caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
-		if caPEM, err := os.ReadFile(caPath); err == nil {
-			pool := x509.NewCertPool()
-			if pool.AppendCertsFromPEM(caPEM) {
-				tlsCfg.RootCAs = pool
-				a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
-			}
-		} else {
-			// First connection — no pinned CA yet. Use system trust store.
-			// The RegistrationAck will send us the CA cert to pin for future connections.
-			a.log.Info(ctx, "agent.tls.system_ca", "msg", "no pinned CA, using system trust store")
-		}
-
-		// Load mTLS client cert+key bundle if previously issued by Atlas.
+	// Load mTLS client cert+key bundle if previously issued by Atlas.
+	// Only load if we have a pinned CA — a stale client cert from a
+	// previous CA will cause the server to reject the connection.
+	if hasPinnedCA {
 		bundlePath := filepath.Join(a.dataDir, "client.pem")
 		if bundle, err := os.ReadFile(bundlePath); err == nil {
 			if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
@@ -95,10 +97,10 @@ func (a *Agent) Run(ctx context.Context) error {
 				a.log.Info(ctx, "agent.mtls_enabled")
 			}
 		}
-
-		creds := credentials.NewTLS(tlsCfg)
-		opts = append(opts, grpc.WithTransportCredentials(creds))
 	}
+
+	creds := credentials.NewTLS(tlsCfg)
+	opts = append(opts, grpc.WithTransportCredentials(creds))
 
 	a.log.Info(ctx, "agent.connecting", "addr", a.atlasAddr)
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -11,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zwiron/pkg/config"
 	"github.com/zwiron/pkg/logger"
 	"github.com/zwiron/pkg/tracing"
 
@@ -28,32 +28,25 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	token := flag.String("token", "", "agent registration token from Atlas dashboard")
-	atlasAddr := flag.String("atlas-addr", "localhost:9090", "Atlas gRPC server address")
-	dataDir := flag.String("data-dir", defaultDataDir(), "directory for keys and checkpoints")
-	insecureFlag := flag.Bool("insecure", false, "use insecure gRPC connection (no TLS)")
-	maxJobs := flag.Int("max-concurrent-jobs", 0, "maximum concurrent jobs (0 = unlimited)")
-	metricsPort := flag.String("metrics-port", "9091", "port for Prometheus /metrics endpoint (0 = disabled)")
-	flag.Parse()
-
-	if *token == "" {
-		*token = os.Getenv("ZWIRON_AGENT_TOKEN")
-	}
-	if *token == "" {
-		return fmt.Errorf("--token or ZWIRON_AGENT_TOKEN is required")
-	}
-
-	if envAddr := os.Getenv("ZWIRON_ATLAS_ADDR"); envAddr != "" && *atlasAddr == "localhost:9090" {
-		*atlasAddr = envAddr
-	}
-
-	if envMaxJobs := os.Getenv("ZWIRON_MAX_CONCURRENT_JOBS"); envMaxJobs != "" && *maxJobs == 0 {
-		if n, err := fmt.Sscanf(envMaxJobs, "%d", maxJobs); n != 1 || err != nil {
-			return fmt.Errorf("invalid ZWIRON_MAX_CONCURRENT_JOBS: %s", envMaxJobs)
+	cfg := struct {
+		Token   string `conf:"required,mask"`
+		Addr    string `conf:"default:localhost:9090"`
+		DataDir string `conf:"default:auto"`
+		MaxJobs int    `conf:"default:0"`
+		Metrics struct {
+			Port string `conf:"default:9091"`
 		}
+		OTel struct {
+			Host string `conf:"default:disabled"`
+		}
+	}{}
+	config.MustParse("ZWIRON", &cfg)
+
+	if cfg.DataDir == "auto" {
+		cfg.DataDir = defaultDataDir()
 	}
 
-	if err := os.MkdirAll(*dataDir, 0700); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
@@ -61,11 +54,10 @@ func run(ctx context.Context) error {
 	// Tracing
 	// -------------------------------------------------------------------------
 
-	otelHost := os.Getenv("ZWIRON_OTEL_HOST")
 	_, tracingShutdown, err := tracing.Init(tracing.Config{
 		ServiceName:    "agent",
 		ServiceVersion: "develop",
-		Host:           otelHost,
+		Host:           cfg.OTel.Host,
 		Probability:    1.0,
 	})
 	if err != nil {
@@ -84,12 +76,11 @@ func run(ctx context.Context) error {
 	}, tracing.GetTraceID)
 
 	log.Info(ctx, "agent.config",
-		"atlas_addr", *atlasAddr,
-		"data_dir", *dataDir,
-		"insecure", *insecureFlag,
+		"atlas_addr", cfg.Addr,
+		"data_dir", cfg.DataDir,
 	)
 
-	keyPath := filepath.Join(*dataDir, "agent.key")
+	keyPath := filepath.Join(cfg.DataDir, "agent.key")
 	keys, err := LoadOrGenerateKeys(keyPath, log)
 	if err != nil {
 		return fmt.Errorf("key management: %w", err)
@@ -113,12 +104,11 @@ func run(ctx context.Context) error {
 
 	agent := &Agent{
 		log:       log,
-		token:     *token,
-		atlasAddr: *atlasAddr,
-		insecure:  *insecureFlag,
-		dataDir:   *dataDir,
+		token:     cfg.Token,
+		atlasAddr: cfg.Addr,
+		dataDir:   cfg.DataDir,
 		keys:      keys,
-		maxJobs:   *maxJobs,
+		maxJobs:   cfg.MaxJobs,
 		metrics:   agentMetrics,
 	}
 
@@ -129,8 +119,8 @@ func run(ctx context.Context) error {
 	}
 
 	// Start Prometheus metrics server.
-	if *metricsPort != "0" {
-		StartMetricsServer(ctx, log, agentMetrics, *metricsPort)
+	if cfg.Metrics.Port != "0" {
+		StartMetricsServer(ctx, log, agentMetrics, cfg.Metrics.Port)
 	}
 
 	// Reconnect loop with exponential backoff + jitter.
