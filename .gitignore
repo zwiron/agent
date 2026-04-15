@@ -34,3 +34,4 @@ agent
 bin/
 
 .*
+!.github/
