@@ -8,16 +8,18 @@ import (
 	"github.com/kardianos/service"
 )
 
+const defaultAtlasAddr = "grpc.zwiron.com:443"
+
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	token := fs.String("token", "", "agent registration token (required)")
-	addr := fs.String("addr", "", "Atlas gRPC address (required)")
+	addr := fs.String("addr", defaultAtlasAddr, "Atlas gRPC address")
 	maxJobs := fs.Int("max-jobs", 0, "maximum concurrent jobs (0 = unlimited)")
 	metricsPort := fs.String("metrics-port", "9091", "Prometheus metrics port (0 = disabled)")
 	fs.Parse(args)
 
-	if *token == "" || *addr == "" {
-		fmt.Fprintln(os.Stderr, "Usage: sudo zwiron-agent install --token <token> --addr <atlas-addr>")
+	if *token == "" {
+		fmt.Fprintln(os.Stderr, "Usage: sudo zwiron-agent install --token <token>")
 		os.Exit(1)
 	}
 

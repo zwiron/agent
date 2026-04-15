@@ -15,7 +15,7 @@ import (
 func cmdRun() error {
 	cfg := struct {
 		Token   string `conf:"required,mask"`
-		Addr    string `conf:"default:localhost:9090"`
+		Addr    string `conf:"default:grpc.zwiron.com:443"`
 		DataDir string `conf:"default:auto"`
 		MaxJobs int    `conf:"default:0"`
 		Metrics struct {
@@ -75,10 +75,10 @@ Commands:
   version     Print version
 
 Install:
-  sudo zwiron-agent install --token <token> --addr <atlas-grpc-addr>
+  sudo zwiron-agent install --token <token>
 
 Run (foreground):
-  ZWIRON_TOKEN=<token> ZWIRON_ADDR=<addr> zwiron-agent run
+  ZWIRON_TOKEN=<token> zwiron-agent run
 
 `, version)
 }

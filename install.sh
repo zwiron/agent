@@ -17,7 +17,7 @@ main() {
     echo "  zwiron-agent ${VERSION} installed to ${INSTALL_DIR}/${BINARY}"
     echo ""
     echo "  Next steps:"
-    echo "    sudo zwiron-agent install --token <TOKEN> --addr <ATLAS_ADDR>:9090"
+    echo "    sudo zwiron-agent install --token <TOKEN>"
     echo ""
 }
 

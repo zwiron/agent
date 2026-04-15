@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -65,42 +66,45 @@ func (a *Agent) Run(ctx context.Context) error {
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
 
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	}
-
-	// Load pinned Atlas CA cert if available (received in previous RegistrationAck).
-	caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
-	hasPinnedCA := false
-	if caPEM, err := os.ReadFile(caPath); err == nil {
-		pool := x509.NewCertPool()
-		if pool.AppendCertsFromPEM(caPEM) {
-			tlsCfg.RootCAs = pool
-			hasPinnedCA = true
-			a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
-		}
+	// Determine TLS mode based on the target address.
+	// - Port 443 (e.g. grpc.zwiron.com:443): use system CA roots (LB terminates TLS).
+	// - Direct connection (e.g. localhost:9090): use trust-on-first-use with pinned CA.
+	_, port, _ := net.SplitHostPort(a.atlasAddr)
+	if port == "443" {
+		// Production mode — TLS terminated by load balancer. Use system CA roots.
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+		a.log.Info(ctx, "agent.tls.system_roots", "addr", a.atlasAddr)
 	} else {
-		// First connection — no pinned CA yet. Trust the server's cert and
-		// pin the CA from RegistrationAck for all future connections.
-		tlsCfg.InsecureSkipVerify = true
-		a.log.Info(ctx, "agent.tls.first_connect", "msg", "no pinned CA, will trust-on-first-use")
-	}
+		// Direct mode — trust-on-first-use with optional mTLS.
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
-	// Load mTLS client cert+key bundle if previously issued by Atlas.
-	// Only load if we have a pinned CA — a stale client cert from a
-	// previous CA will cause the server to reject the connection.
-	if hasPinnedCA {
-		bundlePath := filepath.Join(a.dataDir, "client.pem")
-		if bundle, err := os.ReadFile(bundlePath); err == nil {
-			if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
-				tlsCfg.Certificates = []tls.Certificate{pair}
-				a.log.Info(ctx, "agent.mtls_enabled")
+		caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
+		hasPinnedCA := false
+		if caPEM, err := os.ReadFile(caPath); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(caPEM) {
+				tlsCfg.RootCAs = pool
+				hasPinnedCA = true
+				a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
+			}
+		} else {
+			tlsCfg.InsecureSkipVerify = true
+			a.log.Info(ctx, "agent.tls.first_connect", "msg", "no pinned CA, will trust-on-first-use")
+		}
+
+		if hasPinnedCA {
+			bundlePath := filepath.Join(a.dataDir, "client.pem")
+			if bundle, err := os.ReadFile(bundlePath); err == nil {
+				if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
+					tlsCfg.Certificates = []tls.Certificate{pair}
+					a.log.Info(ctx, "agent.mtls_enabled")
+				}
 			}
 		}
-	}
 
-	creds := credentials.NewTLS(tlsCfg)
-	opts = append(opts, grpc.WithTransportCredentials(creds))
+		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	}
 
 	a.log.Info(ctx, "agent.connecting", "addr", a.atlasAddr)
 
