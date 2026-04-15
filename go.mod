@@ -3,6 +3,7 @@ module github.com/zwiron/agent
 go 1.26.1
 
 require (
+	github.com/kardianos/service v1.2.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/zwiron/connector v1.1.15
 	github.com/zwiron/engine v0.14.22
@@ -15,6 +16,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.42.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
