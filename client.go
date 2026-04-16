@@ -288,7 +288,10 @@ func (a *Agent) sendEvent(event *agentv1.ConnectRequest) {
 	err := a.stream.Send(event)
 	a.sendMu.Unlock()
 	if err != nil {
-		a.log.Error(nil, "agent.send.failed", "error", err)
+		a.log.Error(nil, "agent.send.failed",
+			"error", err,
+			"payload_type", fmt.Sprintf("%T", event.GetPayload()),
+		)
 	}
 }
 

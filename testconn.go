@@ -12,17 +12,30 @@ import (
 // handleTestConnection decrypts the config, connects to the database,
 // discovers tables, and reports the result back to Atlas.
 func (a *Agent) handleTestConnection(ctx context.Context, cmd *agentv1.TestConnection) {
+	requestID := cmd.GetRequestId()
+	connectorType := cmd.GetConnectorType()
+
+	// Recover from panics so the agent always sends a result back.
+	defer func() {
+		if r := recover(); r != nil {
+			a.log.Error(ctx, "agent.test_connection.panic",
+				"request_id", requestID,
+				"panic", fmt.Sprintf("%v", r),
+			)
+			a.sendTestResult(requestID, cmd.GetConnectionName(), connectorType, false,
+				fmt.Sprintf("internal error: %v", r), 0, nil)
+		}
+	}()
+
 	// Use a 25s deadline so we always respond within Atlas's 30s timeout.
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-
-	requestID := cmd.GetRequestId()
-	connectorType := cmd.GetConnectorType()
 
 	a.log.Info(ctx, "agent.test_connection.start",
 		"request_id", requestID,
 		"connector_type", connectorType,
 		"connection_name", cmd.GetConnectionName(),
+		"encrypted_config_len", len(cmd.GetEncryptedConfig()),
 	)
 
 	start := time.Now()
@@ -98,6 +111,11 @@ func (a *Agent) handleTestConnection(ctx context.Context, cmd *agentv1.TestConne
 }
 
 func (a *Agent) sendTestResult(requestID, connName, connType string, success bool, errMsg string, latencyMs int32, tables []string) {
+	a.log.Info(nil, "agent.test_connection.sending_result",
+		"request_id", requestID,
+		"success", success,
+		"error", errMsg,
+	)
 	a.sendEvent(&agentv1.ConnectRequest{
 		Payload: &agentv1.ConnectRequest_TestResult{
 			TestResult: &agentv1.TestConnectionResult{
