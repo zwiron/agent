@@ -72,6 +72,7 @@ Commands:
   status      Show agent status
   logs        Tail service logs
   run         Run in foreground (for Docker / development)
+  update      Self-update to latest release
   version     Print version
 
 Install:

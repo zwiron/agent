@@ -54,6 +54,8 @@ func main() {
 		// Strip "run" from args so pkg/config doesn't see it.
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 		err = cmdRun()
+	case "update":
+		err = cmdUpdate()
 	case "version":
 		fmt.Println(version)
 	case "--help", "-h", "help":
