@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/zwiron/connector"
 	agentv1 "github.com/zwiron/proto/gen/go/agent/v1"
@@ -10,6 +11,9 @@ import (
 
 // handleDiscoverSchema introspects a connection and returns full schema info.
 func (a *Agent) handleDiscoverSchema(ctx context.Context, cmd *agentv1.DiscoverSchema) {
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
 	requestID := cmd.GetRequestId()
 	connectorType := cmd.GetConnectorType()
 

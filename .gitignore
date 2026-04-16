@@ -31,7 +31,8 @@ go.work.sum
 # .idea/
 # .vscode/
 agent
+zwiron-agent
 bin/
 
 .*
-!.github/
+!.github/zwiron-agent

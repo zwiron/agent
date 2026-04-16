@@ -13,6 +13,9 @@ import (
 // handleProfileConnection decrypts the config, connects, runs ProfileResult(),
 // and sends the result back to Atlas. All operations are read-only.
 func (a *Agent) handleProfileConnection(ctx context.Context, cmd *agentv1.ProfileConnection) {
+	ctx, cancel := context.WithTimeout(ctx, 55*time.Second)
+	defer cancel()
+
 	requestID := cmd.GetRequestId()
 	connectorType := cmd.GetConnectorType()
 

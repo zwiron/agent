@@ -12,6 +12,10 @@ import (
 // handleTestConnection decrypts the config, connects to the database,
 // discovers tables, and reports the result back to Atlas.
 func (a *Agent) handleTestConnection(ctx context.Context, cmd *agentv1.TestConnection) {
+	// Use a 25s deadline so we always respond within Atlas's 30s timeout.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+
 	requestID := cmd.GetRequestId()
 	connectorType := cmd.GetConnectorType()
 

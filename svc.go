@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/kardianos/service"
@@ -18,13 +19,39 @@ const (
 	serviceDesc = "Zwiron data movement agent"
 )
 
+// svcLogDir returns the platform-appropriate log directory.
+func svcLogDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		return filepath.Join(os.Getenv("ProgramData"), "zwiron", "log")
+	case "darwin":
+		return "/usr/local/var/log"
+	default: // linux
+		return "/var/log/zwiron"
+	}
+}
+
 // svcConfig returns the kardianos service configuration.
 func svcConfig() *service.Config {
-	return &service.Config{
+	logDir := svcLogDir()
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		logDir = ""
+	}
+
+	cfg := &service.Config{
 		Name:        serviceName,
 		DisplayName: "Zwiron Agent",
 		Description: serviceDesc,
 	}
+
+	if logDir != "" {
+		cfg.Option = service.KeyValue{
+			"LogOutput":    true,
+			"LogDirectory": logDir,
+		}
+	}
+
+	return cfg
 }
 
 // program implements service.Interface for kardianos/service.

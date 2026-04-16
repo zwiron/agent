@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 )
 
@@ -16,8 +17,7 @@ func cmdLogs() error {
 		return cmd.Run()
 
 	case "darwin":
-		// launchd logs go to /var/log/ or can be viewed via log stream.
-		logFile := fmt.Sprintf("/usr/local/var/log/%s.err.log", serviceName)
+		logFile := filepath.Join(svcLogDir(), serviceName+".err.log")
 		if _, err := os.Stat(logFile); err == nil {
 			cmd := exec.Command("tail", "-f", "-n", "100", logFile)
 			cmd.Stdout = os.Stdout
