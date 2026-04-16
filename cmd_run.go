@@ -15,7 +15,7 @@ import (
 func cmdRun() error {
 	cfg := struct {
 		Token   string `conf:"required,mask"`
-		Addr    string `conf:"default:grpc.zwiron.com:443"`
+		Addr    string `conf:"default:grpc.zwiron.com:53076"`
 		DataDir string `conf:"default:auto"`
 		MaxJobs int    `conf:"default:0"`
 		Metrics struct {

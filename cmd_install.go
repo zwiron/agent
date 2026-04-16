@@ -8,7 +8,7 @@ import (
 	"github.com/kardianos/service"
 )
 
-const defaultAtlasAddr = "grpc.zwiron.com:443"
+const defaultAtlasAddr = "grpc.zwiron.com:53076"
 
 func cmdInstall(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)

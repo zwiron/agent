@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -66,45 +65,41 @@ func (a *Agent) Run(ctx context.Context) error {
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	}
 
-	// Determine TLS mode based on the target address.
-	// - Port 443 (e.g. grpc.zwiron.com:443): use system CA roots (LB terminates TLS).
-	// - Direct connection (e.g. localhost:9090): use trust-on-first-use with pinned CA.
-	_, port, _ := net.SplitHostPort(a.atlasAddr)
-	if port == "443" {
-		// Production mode — TLS terminated by load balancer. Use system CA roots.
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
-		a.log.Info(ctx, "agent.tls.system_roots", "addr", a.atlasAddr)
+	// TLS: trust-on-first-use with optional mTLS.
+	// On first connect, skip verification and pin the CA from RegistrationAck.
+	// On subsequent connects, verify against the pinned CA.
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+
+	caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
+	hasPinnedCA := false
+	if caPEM, err := os.ReadFile(caPath); err == nil {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM(caPEM) {
+			tlsCfg.RootCAs = pool
+			hasPinnedCA = true
+			a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
+		}
 	} else {
-		// Direct mode — trust-on-first-use with optional mTLS.
-		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
-
-		caPath := filepath.Join(a.dataDir, "atlas-ca.pem")
-		hasPinnedCA := false
-		if caPEM, err := os.ReadFile(caPath); err == nil {
-			pool := x509.NewCertPool()
-			if pool.AppendCertsFromPEM(caPEM) {
-				tlsCfg.RootCAs = pool
-				hasPinnedCA = true
-				a.log.Info(ctx, "agent.tls.pinned_ca", "path", caPath)
-			}
-		} else {
-			tlsCfg.InsecureSkipVerify = true
-			a.log.Info(ctx, "agent.tls.first_connect", "msg", "no pinned CA, will trust-on-first-use")
-		}
-
-		if hasPinnedCA {
-			bundlePath := filepath.Join(a.dataDir, "client.pem")
-			if bundle, err := os.ReadFile(bundlePath); err == nil {
-				if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
-					tlsCfg.Certificates = []tls.Certificate{pair}
-					a.log.Info(ctx, "agent.mtls_enabled")
-				}
-			}
-		}
-
-		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+		tlsCfg.InsecureSkipVerify = true
+		a.log.Info(ctx, "agent.tls.first_connect", "msg", "no pinned CA, will trust-on-first-use")
 	}
+
+	// When we have a pinned CA, also tell TLS to verify against the server
+	// name "zwiron-grpc" instead of the hostname. This avoids breakage when
+	// connecting through TCP proxies whose hostname differs from the cert SANs.
+	if hasPinnedCA {
+		tlsCfg.ServerName = "zwiron-grpc"
+
+		bundlePath := filepath.Join(a.dataDir, "client.pem")
+		if bundle, err := os.ReadFile(bundlePath); err == nil {
+			if pair, err := tls.X509KeyPair(bundle, bundle); err == nil {
+				tlsCfg.Certificates = []tls.Certificate{pair}
+				a.log.Info(ctx, "agent.mtls_enabled")
+			}
+		}
+	}
+
+	opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 
 	a.log.Info(ctx, "agent.connecting", "addr", a.atlasAddr)
 
