@@ -3,10 +3,11 @@ module github.com/zwiron/agent
 go 1.26.1
 
 require (
+	github.com/apache/arrow-go/v18 v18.5.2
 	github.com/kardianos/service v1.2.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/zwiron/connector v1.1.20
-	github.com/zwiron/engine v0.14.22
+	github.com/zwiron/engine v0.14.23
 	github.com/zwiron/pkg/config v0.1.0
 	github.com/zwiron/pkg/logger v0.1.0
 	github.com/zwiron/pkg/tracing v0.1.0
@@ -42,7 +43,6 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
 	github.com/SAP/go-hdb v1.16.5 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
-	github.com/apache/arrow-go/v18 v18.5.2 // indirect
 	github.com/apache/arrow/go/v12 v12.0.1 // indirect
 	github.com/apache/thrift v0.22.0 // indirect
 	github.com/ardanlabs/conf/v3 v3.11.0 // indirect
