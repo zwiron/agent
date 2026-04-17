@@ -73,6 +73,7 @@ Commands:
   logs        Tail service logs
   run         Run in foreground (for Docker / development)
   update      Self-update to latest release
+  reset-certs Clear pinned TLS certificates (fixes CA rotation issues)
   version     Print version
 
 Install:

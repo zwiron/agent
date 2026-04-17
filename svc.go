@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/kardianos/service"
@@ -179,6 +180,22 @@ func runAgentWithConfig(ctx context.Context, cfg AgentConfig) error {
 			return nil
 		}
 
+		// Auto-recover from stale pinned CA certificates. If TLS verification
+		// fails (e.g. Atlas rotated its CA), delete the pinned certs so the
+		// next connect uses trust-on-first-use to re-pin the new CA.
+		if err != nil && isTLSCertError(err) {
+			caPath := filepath.Join(cfg.DataDir, "atlas-ca.pem")
+			clientPath := filepath.Join(cfg.DataDir, "client.pem")
+			if _, statErr := os.Stat(caPath); statErr == nil {
+				os.Remove(caPath)
+				os.Remove(clientPath)
+				log.Warn(ctx, "agent.tls.stale_ca_removed",
+					"msg", "pinned CA failed verification, cleared for re-pin on next connect",
+				)
+				backoff = initialBackoff // retry immediately
+			}
+		}
+
 		if time.Since(connStart) > 30*time.Second {
 			backoff = initialBackoff
 		}
@@ -199,4 +216,13 @@ func runAgentWithConfig(ctx context.Context, cfg AgentConfig) error {
 			backoff = maxBackoff
 		}
 	}
+}
+
+// isTLSCertError returns true if the error is a TLS certificate verification
+// failure, indicating a stale pinned CA that should be cleared.
+func isTLSCertError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "x509:") ||
+		strings.Contains(msg, "certificate signed by unknown authority") ||
+		strings.Contains(msg, "certificate is not trusted")
 }

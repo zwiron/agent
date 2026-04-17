@@ -56,6 +56,8 @@ func main() {
 		err = cmdRun()
 	case "update":
 		err = cmdUpdate()
+	case "reset-certs":
+		err = cmdResetCerts()
 	case "version":
 		fmt.Println(version)
 	case "--help", "-h", "help":
