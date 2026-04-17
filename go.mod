@@ -6,7 +6,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.5.2
 	github.com/kardianos/service v1.2.4
 	github.com/prometheus/client_golang v1.23.2
-	github.com/zwiron/connector v1.1.20
+	github.com/zwiron/connector v1.1.21
 	github.com/zwiron/engine v0.14.23
 	github.com/zwiron/pkg/config v0.1.0
 	github.com/zwiron/pkg/logger v0.1.0
