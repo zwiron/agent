@@ -193,6 +193,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	consecutiveMisses := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -201,7 +203,23 @@ func (a *Agent) heartbeatLoop(ctx context.Context, interval time.Duration) {
 			var m runtime.MemStats
 			runtime.ReadMemStats(&m)
 
-			a.sendMu.Lock()
+			// Use TryLock to avoid blocking on slow event sends.
+			// If another goroutine holds sendMu (e.g. large job event),
+			// we skip this heartbeat to avoid starvation. The server
+			// tolerates up to 3 missed heartbeats (30s) before declaring stale.
+			if !a.sendMu.TryLock() {
+				consecutiveMisses++
+				a.log.Warn(ctx, "agent.heartbeat.skipped", "reason", "sendMu contention", "consecutive_misses", consecutiveMisses)
+				if consecutiveMisses >= 2 {
+					// If we've missed 2+ heartbeats due to lock contention,
+					// force-wait for the lock to avoid being marked stale.
+					a.sendMu.Lock()
+				} else {
+					continue
+				}
+			} else {
+				consecutiveMisses = 0
+			}
 			err := a.stream.Send(&agentv1.ConnectRequest{
 				Payload: &agentv1.ConnectRequest_Heartbeat{
 					Heartbeat: &agentv1.Heartbeat{
